@@ -1,0 +1,11 @@
+{
+  "name": "hyperbee-rs-js-reader",
+  "private": true,
+  "description": "Reads blocks written by the Rust port with npm hyperbee2",
+  "dependencies": {
+    "compact-encoding": "3.5.2",
+    "corestore": "7.16.1",
+    "hyperbee2": "2.21.1",
+    "hypercore": "11.40.3"
+  }
+}

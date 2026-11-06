@@ -1,0 +1,24 @@
+[package]
+name = "hyperbee-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+description = "Hyperbee B-tree on hypercore-rs, compatible with npm hyperbee2"
+keywords = ["hypercore", "hyperbee", "btree", "p2p", "holepunch"]
+categories = ["database", "network-programming"]
+
+[lib]
+name = "hyperbee"
+
+[dependencies]
+bytes = "1"
+compact-encoding-rs = { path = "../compact-encoding-rs" }
+corestore-rs = { path = "../corestore-rs" }
+hypercore-rs = { path = "../hypercore-rs" }
+tokio = { version = "1.40", features = ["sync"] }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1.40", features = ["full"] }
