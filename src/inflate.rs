@@ -22,7 +22,7 @@ pub(crate) async fn inflate(state: &mut TreeState, ptr: PtrId) -> crate::Result<
     let offset = state.ptrs[ptr].offset;
 
     let block = context.get_block(seq, core, None).await?;
-    let base = context.get_loaded_context(core)?;
+    let base = context.get_loaded_context(core).await?;
     let tree = block
         .tree
         .get(offset as usize)
@@ -62,7 +62,7 @@ async fn key_delta(
             .ptr
             .ok_or(crate::Error::Message("cohort without pointer"))?;
         let (cohort_block, _) = load_block(base, co, origin, origin_core).await?;
-        let ctx = base.get_loaded_context(co.core)?;
+        let ctx = base.get_loaded_context(co.core).await?;
         let entries = cohort_block
             .cohorts
             .get(co.offset as usize)
@@ -72,7 +72,7 @@ async fn key_delta(
             let key = match p.ptr {
                 Some(loc) => {
                     let (target, _) = load_block(&ctx, loc, &cohort_block, co.core).await?;
-                    Some(build_key(state, &ctx, loc, &target)?)
+                    Some(build_key(state, &ctx, loc, &target).await?)
                 }
                 None => None,
             };
@@ -84,7 +84,7 @@ async fn key_delta(
     let key = match d.ptr {
         Some(loc) => {
             let (target, _) = load_block(base, loc, origin, origin_core).await?;
-            Some(build_key(state, base, loc, &target)?)
+            Some(build_key(state, base, loc, &target).await?)
         }
         None => None,
     };
@@ -103,7 +103,7 @@ async fn child_delta(
             .ptr
             .ok_or(crate::Error::Message("cohort without pointer"))?;
         let (cohort_block, _) = load_block(base, co, origin, origin_core).await?;
-        let ctx = base.get_loaded_context(co.core)?;
+        let ctx = base.get_loaded_context(co.core).await?;
         let entries = cohort_block
             .cohorts
             .get(co.offset as usize)
@@ -157,7 +157,7 @@ async fn load_block(
     Ok((block, loc.core))
 }
 
-fn build_key(
+async fn build_key(
     state: &mut TreeState,
     base: &Arc<Context>,
     loc: Loc,
@@ -167,7 +167,7 @@ fn build_key(
         .keys
         .get(loc.offset as usize)
         .ok_or(crate::Error::Message("key offset out of range"))?;
-    let key_context = base.get_loaded_context(loc.core)?;
+    let key_context = base.get_loaded_context(loc.core).await?;
     let value_ptr = data.value_ptr.as_ref().map(|p| ValuePointer {
         context: key_context,
         core: p.core,

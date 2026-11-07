@@ -476,7 +476,7 @@ impl TreeState {
 }
 
 impl EncDelta {
-    pub fn from_delta<T: Copy>(d: &Delta<T>, loc: impl Fn(&T) -> Loc) -> Self {
+    pub(crate) fn from_delta<T: Copy>(d: &Delta<T>, loc: impl Fn(&T) -> Loc) -> Self {
         Self {
             kind: d.kind,
             index: d.index,

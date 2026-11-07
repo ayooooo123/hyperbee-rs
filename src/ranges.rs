@@ -36,6 +36,7 @@ pub struct RangeStream {
     inclusive: bool,
     compare: i32,
     opened: bool,
+    read_options: crate::ReadOptions,
 }
 
 impl RangeStream {
@@ -66,10 +67,20 @@ impl RangeStream {
             inclusive,
             compare,
             opened: false,
+            read_options: crate::ReadOptions::default(),
         }
+    }
+    pub(crate) fn with_read_options(mut self, options: crate::ReadOptions) -> Self {
+        self.read_options = options;
+        self
     }
 
     pub async fn next(&mut self) -> Result<Option<Entry>> {
+        let options = self.read_options.clone();
+        crate::READ_OPTIONS.scope(options, self.next_inner()).await
+    }
+
+    async fn next_inner(&mut self) -> Result<Option<Entry>> {
         let inner = self.bee.inner.clone();
         let mut st = inner.state.lock().await;
         if !self.opened {

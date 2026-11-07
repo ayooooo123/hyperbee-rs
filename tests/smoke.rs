@@ -11,7 +11,7 @@ async fn writes_a_js_identical_single_key_block() {
     batch.put(&b"a"[..], &b"1"[..]);
     batch.flush().await.unwrap();
 
-    let core = store.get(GetOptions::key(bee.key())).unwrap();
+    let core = store.get(GetOptions::key(bee.key())).await.unwrap();
     let block = core.get(0, Default::default()).await.unwrap().unwrap();
     assert_eq!(
         hex(&block),

@@ -58,11 +58,12 @@ impl Batch {
     }
 
     async fn flush_inner(&mut self, st: &mut TreeState) -> Result<()> {
-        let ctx = self.bee.context().clone();
+        let ctx = self.bee.inner.context.clone();
         ctx.update(true).await?;
 
         let mut root = self.bee.root_ptr(st).await?;
-        let length = root.map(|p| st.ptrs[p].seq + 1).unwrap_or(0);
+        let previous = self.bee.head().filter(|head| head.length > 0);
+        let length = ctx.core.length();
 
         if root.is_none() {
             let a = st.array_id();
@@ -88,11 +89,17 @@ impl Batch {
             }
         }
 
-        root = self.flush_write(st, &ctx, root, length, applied).await?;
+        root = self
+            .flush_write(st, &ctx, root, length, previous, applied)
+            .await?;
 
         let new_length = st.ptrs[root].seq + 1;
-        self.bee
-            .set_root_ptr(st, Some(root), new_length, *ctx.core.key());
+        self.bee.set_root_ptr(
+            st,
+            Some(root),
+            new_length,
+            *st.ptrs[root].context.core.key(),
+        );
         Ok(())
     }
 
@@ -102,6 +109,7 @@ impl Batch {
         ctx: &Arc<Context>,
         mut root: PtrId,
         length: u64,
+        previous: Option<crate::Head>,
         applied: usize,
     ) -> Result<PtrId> {
         if !st.ptrs[root].changed {
@@ -277,11 +285,11 @@ impl Batch {
             .map(|b| b.expect("every block filled"))
             .collect();
 
-        if !blocks.is_empty() && length > 0 {
-            let core = ctx.get_core_offset_by_key(*ctx.core.key()).await?;
+        if let Some(previous) = previous {
+            let core = ctx.get_core_offset_by_key(previous.key).await?;
             blocks.last_mut().expect("non-empty").block.previous = Some(Loc {
                 core,
-                seq: length - 1,
+                seq: previous.length - 1,
                 offset: 0,
             });
         }
@@ -343,8 +351,8 @@ impl Batch {
         }
 
         let buffers: Vec<Bytes> = blocks
-            .iter()
-            .map(|pending| crate::encoding::encode_block(&pending.block))
+            .into_iter()
+            .map(|pending| crate::encoding::encode_block(pending.block))
             .collect();
         ctx.core.append(&buffers).await?;
         Ok(root)

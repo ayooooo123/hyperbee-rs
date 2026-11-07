@@ -1,7 +1,7 @@
 mod common;
 
 use corestore::{Corestore, GetOptions};
-use hyperbee::{Bee, RangeOptions};
+use hyperbee::{Bee, Head, RangeOptions};
 
 use common::{EntryData, Fixture};
 
@@ -9,7 +9,10 @@ async fn open_fixture(fixture: &Fixture) -> (Bee, Corestore, tempfile::TempDir) 
     let dir = tempfile::tempdir().unwrap();
     let store = Corestore::open_with_primary_key(dir.path(), fixture.primary_key).unwrap();
     for core in &fixture.cores {
-        let session = store.get(GetOptions::name(core.name.as_str())).unwrap();
+        let session = store
+            .get(GetOptions::name(core.name.as_str()))
+            .await
+            .unwrap();
         session.append(&core.blocks).await.unwrap();
     }
     let bee = Bee::open(&store, Some(fixture.root_key)).await.unwrap();
@@ -124,11 +127,23 @@ async fn reads_js_blocks() {
             assert!(empty.is_empty(), "{}: inverted range", fixture.name);
         }
 
-        let snapshot = bee.checkout(root_blocks as u64);
+        let snapshot = bee
+            .checkout(Head {
+                key: bee.key(),
+                length: root_blocks as u64,
+            })
+            .await
+            .unwrap();
         let snapshot_entries = collect(snapshot.range(RangeOptions::default())).await;
         assert_entries(&fixture.name, &snapshot_entries, &fixture.entries);
 
-        let empty = bee.checkout(0);
+        let empty = bee
+            .checkout(Head {
+                key: bee.key(),
+                length: 0,
+            })
+            .await
+            .unwrap();
         assert!(
             collect(empty.range(RangeOptions::default()))
                 .await

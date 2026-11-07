@@ -64,7 +64,7 @@ async fn js_reads_rust_written_bee() {
     }
     assert!(!rust_entries.is_empty());
 
-    let core = store.get(GetOptions::key(bee.key())).unwrap();
+    let core = store.get(GetOptions::key(bee.key())).await.unwrap();
     let mut blocks = Vec::new();
     for i in 0..core.length() {
         let block = core.get(i, Default::default()).await.unwrap().unwrap();

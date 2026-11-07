@@ -11,6 +11,9 @@ categories = ["database", "network-programming"]
 [lib]
 name = "hyperbee"
 
+[build-dependencies]
+hyperschema-rs = { path = "../hyperschema-rs" }
+
 [dependencies]
 bytes = "1"
 compact-encoding-rs = { path = "../compact-encoding-rs" }

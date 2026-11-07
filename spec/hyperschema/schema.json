@@ -1,0 +1,442 @@
+{
+  "version": 2,
+  "schema": [
+    {
+      "name": "tree-pointer-0",
+      "namespace": "bee",
+      "compact": true,
+      "flagsPosition": -1,
+      "fields": [
+        {
+          "name": "core",
+          "required": true,
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "seq",
+          "required": true,
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "offset",
+          "required": true,
+          "type": "uint",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "tree-pointer",
+      "namespace": "bee",
+      "compact": true,
+      "flagsPosition": 0,
+      "fields": [
+        {
+          "name": "core",
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "seq",
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "offset",
+          "type": "uint",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "tree-delta",
+      "namespace": "bee",
+      "compact": true,
+      "flagsPosition": 0,
+      "fields": [
+        {
+          "name": "type",
+          "type": "uint3",
+          "version": 1
+        },
+        {
+          "name": "index",
+          "type": "uint8",
+          "version": 1
+        },
+        {
+          "name": "pointer",
+          "inline": true,
+          "type": "@bee/tree-pointer",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "cohort",
+      "namespace": "bee",
+      "array": true,
+      "type": "@bee/tree-delta"
+    },
+    {
+      "name": "value-pointer",
+      "namespace": "bee",
+      "compact": true,
+      "flagsPosition": 0,
+      "fields": [
+        {
+          "name": "core",
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "seq",
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "offset",
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "split",
+          "type": "uint",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "block-pointer",
+      "namespace": "bee",
+      "compact": true,
+      "flagsPosition": -1,
+      "fields": [
+        {
+          "name": "core",
+          "required": true,
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "seq",
+          "required": true,
+          "type": "uint",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "batch-pointer",
+      "namespace": "bee",
+      "compact": true,
+      "flagsPosition": -1,
+      "fields": [
+        {
+          "name": "start",
+          "required": true,
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "end",
+          "required": true,
+          "type": "uint",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "tree-0",
+      "namespace": "bee",
+      "compact": true,
+      "flagsPosition": -1,
+      "fields": [
+        {
+          "name": "keys",
+          "required": true,
+          "array": true,
+          "type": "@bee/tree-pointer-0",
+          "version": 1
+        },
+        {
+          "name": "children",
+          "required": true,
+          "array": true,
+          "type": "@bee/tree-pointer-0",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "tree",
+      "namespace": "bee",
+      "compact": true,
+      "flagsPosition": -1,
+      "fields": [
+        {
+          "name": "keys",
+          "required": true,
+          "array": true,
+          "type": "@bee/tree-delta",
+          "version": 1
+        },
+        {
+          "name": "children",
+          "required": true,
+          "array": true,
+          "type": "@bee/tree-delta",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "data",
+      "namespace": "bee",
+      "compact": true,
+      "flagsPosition": -1,
+      "fields": [
+        {
+          "name": "key",
+          "required": true,
+          "type": "buffer",
+          "version": 1
+        },
+        {
+          "name": "value",
+          "required": true,
+          "type": "buffer",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "key",
+      "namespace": "bee",
+      "compact": true,
+      "flagsPosition": 1,
+      "fields": [
+        {
+          "name": "key",
+          "required": true,
+          "type": "buffer",
+          "version": 1
+        },
+        {
+          "name": "value",
+          "type": "buffer",
+          "version": 1
+        },
+        {
+          "name": "valuePointer",
+          "inline": true,
+          "type": "@bee/value-pointer",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "core",
+      "namespace": "bee",
+      "compact": true,
+      "flagsPosition": 1,
+      "fields": [
+        {
+          "name": "key",
+          "required": true,
+          "type": "fixed32",
+          "version": 1
+        },
+        {
+          "name": "fork",
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "length",
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "treeHash",
+          "type": "fixed32",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "block-0",
+      "namespace": "bee",
+      "compact": false,
+      "flagsPosition": 4,
+      "fields": [
+        {
+          "name": "type",
+          "required": true,
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "seq",
+          "constant": 0,
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "checkpoint",
+          "required": true,
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "batch",
+          "required": true,
+          "type": "@bee/batch-pointer",
+          "version": 1
+        },
+        {
+          "name": "previous",
+          "type": "@bee/block-pointer",
+          "version": 1
+        },
+        {
+          "name": "tree",
+          "array": true,
+          "type": "@bee/tree-0",
+          "version": 1
+        },
+        {
+          "name": "data",
+          "array": true,
+          "type": "@bee/data",
+          "version": 1
+        },
+        {
+          "name": "cores",
+          "array": true,
+          "type": "@bee/core",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "metadata",
+      "namespace": "bee",
+      "compact": false,
+      "flagsPosition": 1,
+      "fields": [
+        {
+          "name": "cores",
+          "required": true,
+          "array": true,
+          "type": "@bee/core",
+          "version": 1
+        },
+        {
+          "name": "mappings",
+          "array": true,
+          "type": "@bee/mapping",
+          "version": 2
+        }
+      ]
+    },
+    {
+      "name": "block-1",
+      "namespace": "bee",
+      "compact": false,
+      "flagsPosition": 4,
+      "fields": [
+        {
+          "name": "type",
+          "required": true,
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "seq",
+          "constant": 0,
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "checkpoint",
+          "required": true,
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "batch",
+          "required": true,
+          "type": "@bee/batch-pointer",
+          "version": 1
+        },
+        {
+          "name": "previous",
+          "type": "@bee/block-pointer",
+          "version": 1
+        },
+        {
+          "name": "metadata",
+          "type": "@bee/metadata",
+          "version": 1
+        },
+        {
+          "name": "tree",
+          "array": true,
+          "type": "@bee/tree",
+          "version": 1
+        },
+        {
+          "name": "keys",
+          "array": true,
+          "type": "@bee/key",
+          "version": 1
+        },
+        {
+          "name": "values",
+          "array": true,
+          "type": "buffer",
+          "version": 1
+        },
+        {
+          "name": "cohorts",
+          "array": true,
+          "type": "@bee/cohort",
+          "version": 1
+        },
+        {
+          "name": "t",
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "invalidation",
+          "type": "uint",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "mapping",
+      "namespace": "bee",
+      "compact": true,
+      "flagsPosition": -1,
+      "fields": [
+        {
+          "name": "from",
+          "required": true,
+          "type": "fixed32",
+          "version": 2
+        },
+        {
+          "name": "to",
+          "required": true,
+          "type": "fixed32",
+          "version": 2
+        }
+      ]
+    }
+  ]
+}

@@ -9,7 +9,6 @@ use corestore::Corestore;
 use corestore::GetOptions as StoreGetOptions;
 use hypercore::GetOptions;
 use hypercore::Session;
-use hypercore::storage::Batch as StorageBatch;
 
 use crate::Error;
 use crate::encoding::{Block, CoreInfo, decode_block};
@@ -20,6 +19,11 @@ pub(crate) type MappingsFlush = Option<Vec<([u8; 32], [u8; 32])>>;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+fn read_options() -> GetOptions {
+    crate::READ_OPTIONS
+        .try_with(Clone::clone)
+        .unwrap_or_default()
 }
 
 #[derive(Default)]
@@ -71,6 +75,7 @@ pub(crate) struct Shared {
     pub store: Corestore,
     pub mappings: Mutex<Mappings>,
     pub other: Mutex<HashMap<[u8; 32], Arc<Context>>>,
+    pub encryption: Option<crate::EncryptionProvider>,
 }
 
 pub(crate) struct CtxState {
@@ -135,9 +140,13 @@ impl Context {
         let raw = self.raw_core_key(index)?;
         Ok(lock(&self.shared.mappings).resolve(raw))
     }
+    pub fn core_keys(&self) -> crate::Result<Vec<[u8; 32]>> {
+        let count = lock(&self.state).cores.len();
+        (0..=count).map(|i| self.core_key(i as u64)).collect()
+    }
 
     /// The session for a core index, opening it through the store on first use.
-    pub fn core(&self, index: u64) -> crate::Result<Arc<Session>> {
+    pub async fn core(&self, index: u64) -> crate::Result<Arc<Session>> {
         if index == 0 {
             return Ok(self.core.clone());
         }
@@ -154,7 +163,13 @@ impl Context {
             return Ok(session);
         }
         let key = lock(&self.shared.mappings).resolve(key);
-        let session = Arc::new(self.shared.store.get(StoreGetOptions::key(key))?);
+        let mut options = StoreGetOptions::key(key);
+        options.encryption_key = self
+            .shared
+            .encryption
+            .as_ref()
+            .and_then(|provider| provider(&key));
+        let session = Arc::new(self.shared.store.get(options).await?);
         let mut s = lock(&self.state);
         if index as usize <= s.opened.len() {
             s.opened[index as usize - 1] = Some(session.clone());
@@ -190,7 +205,7 @@ impl Context {
         let seq = length - 1;
         let buffer = self
             .core
-            .get(seq, GetOptions::default())
+            .get(seq, read_options())
             .await?
             .ok_or(Error::BlockNotAvailable)?;
         let block = decode_block(buffer, seq)?;
@@ -214,7 +229,7 @@ impl Context {
         if checkpoint > 0 && checkpoint != cur_checkpoint {
             let buffer = self
                 .core
-                .get(checkpoint - 1, GetOptions::default())
+                .get(checkpoint - 1, read_options())
                 .await?
                 .ok_or(Error::BlockNotAvailable)?;
             let cp_block = decode_block(buffer, checkpoint - 1)?;
@@ -249,9 +264,9 @@ impl Context {
         }
 
         if persist {
-            let mut batch = StorageBatch::default();
-            batch.put_user_data(CHECKPOINT_KEY, Some(encode(&length)));
-            self.core.storage().write(batch)?;
+            self.core
+                .set_user_data(CHECKPOINT_KEY, Some(&encode(&length)))
+                .await?;
         }
         Ok(())
     }
@@ -271,7 +286,6 @@ impl Context {
 
         let cached = self
             .core
-            .storage()
             .user_data(CHECKPOINT_KEY)?
             .map(decode::<u64>)
             .transpose()?
@@ -295,7 +309,7 @@ impl Context {
         let buffer = self.get_block_buffer(seq, core, origin).await?;
         let block = decode_block(buffer, seq)?;
         if block.invalidation != 0 {
-            let ctx = self.get_loaded_context(core)?;
+            let ctx = self.get_loaded_context(core).await?;
             if block.invalidation > ctx.invalidation() {
                 ctx.update_maybe(0, Some(&block)).await?;
             }
@@ -312,21 +326,21 @@ impl Context {
         if core > lock(&self.state).cores.len() as u64 {
             self.update_maybe(core, origin).await?;
         }
-        let session = self.core(core)?;
+        let session = self.core(core).await?;
         session
-            .get(seq, GetOptions::default())
+            .get(seq, read_options())
             .await?
             .ok_or(Error::BlockNotAvailable)
     }
 
-    pub fn get_loaded_context(self: &Arc<Self>, core: u64) -> crate::Result<Arc<Context>> {
+    pub async fn get_loaded_context(self: &Arc<Self>, core: u64) -> crate::Result<Arc<Context>> {
         if core == 0 {
             return Ok(self.clone());
         }
         if core as usize > lock(&self.state).cores.len() {
             return Err(Error::BadCoreIndex(core));
         }
-        let session = self.core(core)?;
+        let session = self.core(core).await?;
         let key = *session.key();
         if let Some(ctx) = lock(&self.shared.other).get(&key) {
             return Ok(ctx.clone());

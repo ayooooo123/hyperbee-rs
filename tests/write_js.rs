@@ -40,7 +40,7 @@ async fn writes_the_same_blocks_as_hyperbee2() {
             fixture.name
         );
         let blocks = &fixture.cores[0].blocks;
-        let core = store.get(GetOptions::key(fixture.root_key)).unwrap();
+        let core = store.get(GetOptions::key(fixture.root_key)).await.unwrap();
         assert_eq!(
             core.length(),
             blocks.len() as u64,
