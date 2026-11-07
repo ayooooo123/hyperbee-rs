@@ -55,7 +55,9 @@ pub(crate) fn decode(buffer: Bytes, seq: u64) -> crate::Result<Block> {
             let offset = cohorts.len() as u64;
             let cohort: Vec<EncDelta> = level
                 .children
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .enumerate()
                 .map(|(i, pair)| EncDelta {
                     kind: OP_INSERT,
