@@ -5,7 +5,7 @@
   "dependencies": {
     "compact-encoding": "3.5.2",
     "corestore": "7.16.1",
-    "hyperbee2": "2.21.1",
+    "hyperbee2": "^2.21.4",
     "hypercore": "11.40.3"
   }
 }

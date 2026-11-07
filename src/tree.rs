@@ -53,7 +53,9 @@ pub(crate) struct Node {
 
 #[derive(Clone, Debug)]
 pub(crate) enum DeltaRef<T> {
-    Loc(Loc),
+    /// A location decoded from, or written into, the block of `context`; the
+    /// core index is only meaningful against that context (JS `Pointer.context`).
+    Loc(Arc<Context>, Loc),
     Id(T),
 }
 
@@ -261,7 +263,7 @@ impl<T: Copy> CompressedArray<T> {
         direct.reverse();
         let l = direct.len();
 
-        if l > min && l < self.entries.len() && !overflow && self.delta.len() + l <= max {
+        if l > min && l < self.entries.len() && !overflow && self.delta.len() < max {
             self.delta.push(Delta::cohort(true, None, direct));
         } else {
             self.delta = vec![rebuild_cohort(&self.entries)];
@@ -481,7 +483,7 @@ impl EncDelta {
             kind: d.kind,
             index: d.index,
             ptr: d.ptr.as_ref().map(|p| match p {
-                DeltaRef::Loc(l) => *l,
+                DeltaRef::Loc(_, l) => *l,
                 DeltaRef::Id(id) => loc(id),
             }),
         }

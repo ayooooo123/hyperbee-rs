@@ -29,6 +29,14 @@ function value(i) {
   return Buffer.from('value-' + String(i).padStart(4, '0'))
 }
 
+function item(i) {
+  return Buffer.from('item/' + i)
+}
+
+function itemValue(i) {
+  return Buffer.from('value/' + i)
+}
+
 function bigValue(i, len) {
   const out = Buffer.alloc(len)
   out.fill((i + 1) % 251)
@@ -225,6 +233,28 @@ function scenarios() {
     list.push({ name: 'parent-split', seed: 14, batches })
   }
 
+  {
+    // one batch and flush per key: exercises the delta-cohort rebase and the
+    // node split that only shows up when the deltas pile up between flushes
+    const batches = []
+    for (let i = 0; i < 300; i++) batches.push([put(item(i), itemValue(i))])
+    list.push({ name: 'sequential-flush', seed: 16, batches })
+  }
+
+  {
+    const rand = mulberry32(17)
+    const order = []
+    for (let i = 0; i < 240; i++) order.push(i)
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = Math.floor(rand() * (i + 1))
+      ;[order[i], order[j]] = [order[j], order[i]]
+    }
+    const batches = order.map((i) => [put(item(i), itemValue(i))])
+    list.push({ name: 'random-flush', seed: 17, batches })
+  }
+
+  list.push({ name: 'moved-core', seed: 18, batches: [], moved: true })
+
   return list
 }
 
@@ -409,7 +439,8 @@ async function runMapped(scenario, dir) {
   }
   await root.append([encodeBlock(block)])
 
-  const view = new Hyperbee(store, { core: root })
+  // 2.21.4 leaves mappings off unless asked for it
+  const view = new Hyperbee(store, { core: root, mappings: true })
   await view.ready()
   const entries = []
   for await (const entry of view.createReadStream()) {
@@ -435,12 +466,73 @@ async function runMapped(scenario, dir) {
   console.log(`${scenario.name}: mapped core, ${entries.length} entry`)
 }
 
+async function runMoved(scenario, dir) {
+  const primaryKey = fixtureSeed(scenario.seed)
+  const store = new Corestore(dir, { primaryKey, unsafe: true })
+
+  // the original view core: enough single-key flushes to leave a mid-tree
+  // cohort delta on the node the move lands on
+  const coreA = store.get({ name: 'view-a' })
+  const a = new Hyperbee(store, { core: coreA })
+  await a.ready()
+  for (let i = 0; i < 25; i++) {
+    const batch = a.write()
+    batch.tryPut(item(i), itemValue(i))
+    await batch.flush()
+  }
+
+  // a fresh writable core moved onto that head, like a fast-forward landing
+  const coreB = store.get({ name: 'view-b' })
+  const bee = new Hyperbee(store, { core: coreB, writable: true })
+  await bee.ready()
+  bee.move({ key: coreA.key, length: coreA.length })
+  for (let i = 0; i < 3; i++) {
+    const batch = bee.write()
+    batch.tryPut(item(25 + i), itemValue(25 + i))
+    await batch.flush()
+  }
+
+  const entries = []
+  for await (const entry of bee.createReadStream()) {
+    entries.push({ seq: entry.seq, key: hex(entry.key), value: hex(entry.value) })
+  }
+
+  const blocksOf = async (core) => {
+    const blocks = []
+    for (let i = 0; i < core.length; i++) blocks.push(hex(await core.get(i)))
+    return blocks
+  }
+
+  const fixture = {
+    name: scenario.name,
+    primaryKey: hex(primaryKey),
+    rootKey: hex(coreB.key),
+    replayable: false,
+    batches: [],
+    move: { key: hex(coreA.key), length: coreA.length },
+    cores: [
+      { name: 'view-a', key: hex(coreA.key), blocks: await blocksOf(coreA) },
+      { name: 'view-b', key: hex(coreB.key), blocks: await blocksOf(coreB) }
+    ],
+    entries
+  }
+
+  fs.writeFileSync(path.join(OUT, scenario.name + '.json'), JSON.stringify(fixture))
+  await store.close()
+  fs.rmSync(dir, { recursive: true, force: true })
+
+  console.log(
+    `${scenario.name}: moved onto another core, ${fixture.cores[1].blocks.length} local blocks`
+  )
+}
+
 async function run(scenario) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hyperbee-fixture-'))
   const primaryKey = fixtureSeed(scenario.seed)
   if (scenario.multi) return runMulti(scenario, dir)
   if (scenario.mapped) return runMapped(scenario, dir)
   if (scenario.block0) return runBlock0(scenario, dir)
+  if (scenario.moved) return runMoved(scenario, dir)
 
   const store = new Corestore(dir, { primaryKey, unsafe: true })
   const bee = new Hyperbee(store)

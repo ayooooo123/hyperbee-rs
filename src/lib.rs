@@ -1,4 +1,4 @@
-//! Hyperbee on hypercore: a B-tree compatible with npm hyperbee2 2.21.1.
+//! Hyperbee on hypercore: a B-tree compatible with npm hyperbee2 2.21.4.
 
 #![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]

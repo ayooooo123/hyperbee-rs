@@ -1,9 +1,9 @@
 # hyperbee-rs
 
-A Rust port of the npm `hyperbee2` B-tree (reference version 2.21.1) on top of
+A Rust port of the npm `hyperbee2` B-tree (reference version 2.21.4) on top of
 [`hypercore-rs`](../hypercore-rs) and [`corestore-rs`](../corestore-rs).
 
-The reader accepts every block type hyperbee2 2.21.1 reads (latest block type 1,
+The reader accepts every block type hyperbee2 2.21.4 reads (latest block type 1,
 legacy block type 0 and bee1 compat blocks). The writer produces byte-identical
 blocks to hyperbee2's default (`type 1`) writer for the same batch sequence,
 including the same splits, merges, cohorts, value blocks and checkpoint/
@@ -93,7 +93,7 @@ same `Corestore`, as in the JS implementation.
 ## Fixtures and tests
 
 Generated fixtures live in `fixtures/`; `fixtures/gen/gen.js` writes them with
-npm `hyperbee2 2.21.1`, `corestore 7.16.1` and `hypercore 11.40.3`:
+npm `hyperbee2 2.21.4`, `corestore 7.16.1` and `hypercore 11.40.3`:
 
 ```sh
 cd fixtures/gen && npm install && node gen.js
@@ -108,6 +108,9 @@ cd fixtures/gen && npm install && node gen.js
   with `cargo test -- --include-ignored` after `npm install` in `tests/js`.
 - `fixtures/gen/completion.js` and `tests/completion.rs`: cross-core move,
   changes, core listing, reindexing and byte comparisons.
+- `tests/moved_core.rs`: writes after moving onto a head on another core
+  (`fixtures/moved-core.json`), pinning the cross-core relocation of the delta
+  cohort pointer.
 - `tests/smoke.rs`: single-key block byte check.
 
 ```sh

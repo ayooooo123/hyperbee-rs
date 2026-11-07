@@ -78,7 +78,11 @@ async fn key_delta(
             };
             deltas.push(Delta::new(false, p.kind, p.index, key.map(DeltaRef::Id)));
         }
-        return Ok(Delta::cohort(false, Some(DeltaRef::Loc(co)), deltas));
+        return Ok(Delta::cohort(
+            false,
+            Some(DeltaRef::Loc(base.clone(), co)),
+            deltas,
+        ));
     }
 
     let key = match d.ptr {
@@ -128,7 +132,11 @@ async fn child_delta(
             };
             deltas.push(Delta::new(false, p.kind, p.index, ptr.map(DeltaRef::Id)));
         }
-        return Ok(Delta::cohort(false, Some(DeltaRef::Loc(co)), deltas));
+        return Ok(Delta::cohort(
+            false,
+            Some(DeltaRef::Loc(base.clone(), co)),
+            deltas,
+        ));
     }
 
     let ptr = match d.ptr {

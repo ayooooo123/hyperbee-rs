@@ -916,6 +916,9 @@ fn prepare_keys(
         {
             d.ptr = None;
         }
+        if let Some(DeltaRef::Loc(from, loc)) = &mut d.ptr {
+            relocate_loc(from, ctx, loc)?;
+        }
         if let Some(DeltaRef::Id(k)) = d.ptr {
             relocate_key(st, ctx, k)?;
         }
@@ -923,11 +926,14 @@ fn prepare_keys(
             continue;
         }
         d.changed = false;
-        d.ptr = Some(DeltaRef::Loc(Loc {
-            core: 0,
-            seq,
-            offset: cohorts.len() as u64,
-        }));
+        d.ptr = Some(DeltaRef::Loc(
+            ctx.clone(),
+            Loc {
+                core: 0,
+                seq,
+                offset: cohorts.len() as u64,
+            },
+        ));
 
         for dd in d.cohort.iter_mut() {
             if dd.changed
@@ -954,6 +960,9 @@ fn prepare_children(
     cohorts: &mut Vec<PendingCohort>,
 ) -> Result<()> {
     for d in deltas.iter_mut() {
+        if let Some(DeltaRef::Loc(from, loc)) = &mut d.ptr {
+            relocate_loc(from, ctx, loc)?;
+        }
         if let Some(DeltaRef::Id(p)) = d.ptr {
             relocate_ptr(st, ctx, p)?;
         }
@@ -961,11 +970,14 @@ fn prepare_children(
             continue;
         }
         d.changed = false;
-        d.ptr = Some(DeltaRef::Loc(Loc {
-            core: 0,
-            seq,
-            offset: cohorts.len() as u64,
-        }));
+        d.ptr = Some(DeltaRef::Loc(
+            ctx.clone(),
+            Loc {
+                core: 0,
+                seq,
+                offset: cohorts.len() as u64,
+            },
+        ));
 
         for dd in d.cohort.iter_mut() {
             dd.changed = false;
@@ -974,6 +986,16 @@ fn prepare_children(
             }
         }
         cohorts.push(PendingCohort::Children(d.cohort.clone()));
+    }
+    Ok(())
+}
+
+/// A cohort pointer carries the context it was decoded from, so its core index
+/// has to be translated like any other pointer before it can be re-emitted.
+fn relocate_loc(from: &mut Arc<Context>, ctx: &Arc<Context>, loc: &mut Loc) -> Result<()> {
+    if !Arc::ptr_eq(from, ctx) {
+        loc.core = ctx.get_core_offset_local(from, loc.core)?;
+        *from = ctx.clone();
     }
     Ok(())
 }
