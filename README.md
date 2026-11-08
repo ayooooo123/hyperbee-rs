@@ -131,6 +131,12 @@ its contexts and core sessions without requiring `store.close()`. The
 cold-opens the resulting tree, checks lookup identity and expired-entry reload,
 then drops every bee. Retained shared owners, tracked contexts and sessions fell
 from 2 / 1 / 2 to 0 / 0 / 0; the old strong context cache formed an ownership cycle.
+Mapped keys resolve before context lookup, so alias, canonical and indexed
+lookups share the same live context. Concurrent cold opens of one core index
+also reuse the session cached by the first caller; the losing session closes.
+Regressions check mapped-context identity and force both cold callers past the
+empty-cache check before either opens a session, leaving exactly one session
+until the parent context drops.
 
 `CATALOG_ENTRIES=10000 cargo test --release --test catalog_perf -- --ignored --nocapture`
 measures three cold catalog lists plus point lookups in isolated synthetic stores

@@ -173,6 +173,9 @@ impl Context {
         let session = Arc::new(self.shared.store.get(options).await?);
         let mut s = lock(&self.state);
         if index as usize <= s.opened.len() {
+            if let Some(existing) = &s.opened[index as usize - 1] {
+                return Ok(existing.clone());
+            }
             s.opened[index as usize - 1] = Some(session.clone());
         }
         Ok(session)

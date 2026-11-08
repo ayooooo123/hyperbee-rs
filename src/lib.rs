@@ -425,6 +425,7 @@ impl Bee {
     }
 
     async fn context_by_key(&self, key: [u8; 32]) -> Result<Arc<Context>> {
+        let key = lock(&self.inner.shared.mappings).resolve(key);
         if key == *self.inner.context.core.key() {
             return Ok(self.inner.context.clone());
         }
@@ -579,6 +580,81 @@ mod tests {
             sessions, 0,
             "cross-core sessions must close without store.close"
         );
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn mapped_keys_share_the_resolved_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Corestore::open(dir.path()).unwrap();
+        let bee = Bee::open(&store, None).await.unwrap();
+        let target = store.get(StoreGetOptions::name("target")).await.unwrap();
+        let target_key = *target.key();
+        drop(target);
+        let alias = [0x42; 32];
+        let root_alias = [0x43; 32];
+        lock(&bee.inner.shared.mappings).add(&[(alias, target_key), (root_alias, bee.key())], true);
+
+        let direct = bee.context_by_key(target_key).await.unwrap();
+        let mapped = bee.context_by_key(alias).await.unwrap();
+        assert!(Arc::ptr_eq(&direct, &mapped));
+        assert_eq!(*mapped.core.key(), target_key);
+        let index = bee
+            .inner
+            .context
+            .get_core_offset_by_key(alias)
+            .await
+            .unwrap();
+        let indexed = bee.inner.context.get_loaded_context(index).await.unwrap();
+        assert!(Arc::ptr_eq(&direct, &indexed));
+        let local = bee.context_by_key(root_alias).await.unwrap();
+        assert!(Arc::ptr_eq(&local, &bee.inner.context));
+        store.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_cold_core_calls_share_one_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Corestore::open(dir.path()).unwrap();
+        let target = store.get(StoreGetOptions::name("target")).await.unwrap();
+        let target_key = *target.key();
+        drop(target);
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let provider: EncryptionProvider = Arc::new(move |key| {
+            assert_eq!(*key, target_key);
+            // Both callers pass the cold-cache check before either opens a session.
+            barrier.wait();
+            None
+        });
+        let session = Arc::new(store.get(StoreGetOptions::name("view")).await.unwrap());
+        let bee = Bee::from_session_with_encryption(&store, session, Some(provider))
+            .await
+            .unwrap();
+        let index = bee
+            .inner
+            .context
+            .get_core_offset_by_key(target_key)
+            .await
+            .unwrap();
+        let first = tokio::spawn({
+            let context = bee.inner.context.clone();
+            async move { context.core(index).await.unwrap() }
+        });
+        let second = tokio::spawn({
+            let context = bee.inner.context.clone();
+            async move { context.core(index).await.unwrap() }
+        });
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        let target_core = first.core().clone();
+        assert_eq!(target_core.session_count(), 1);
+        drop(first);
+        drop(second);
+        assert_eq!(target_core.session_count(), 1);
+        drop(bee);
+        assert_eq!(target_core.session_count(), 0);
         store.close().await;
     }
 }
