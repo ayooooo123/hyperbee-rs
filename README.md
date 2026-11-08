@@ -124,6 +124,14 @@ temporary cache. It never caches decoded blocks across forks or later reads.
 Apply and lazy tree inflation still share the ordered tree-state lock; snapshots
 share that arena too, so replacing it with a read lock would not make reads safe.
 
+Cross-core context lookup stores weak references: live contexts retain their
+identity, expired contexts reload by key, and dropping the last tree releases
+its contexts and core sessions without requiring `store.close()`. The
+`cross_core_contexts_close_with_the_last_bee` regression writes across two cores,
+cold-opens the resulting tree, checks lookup identity and expired-entry reload,
+then drops every bee. Retained shared owners, tracked contexts and sessions fell
+from 2 / 1 / 2 to 0 / 0 / 0; the old strong context cache formed an ownership cycle.
+
 `CATALOG_ENTRIES=10000 cargo test --release --test catalog_perf -- --ignored --nocapture`
 measures three cold catalog lists plus point lookups in isolated synthetic stores
 (32-entry batches, 256-byte values). Three-run release medians on Apple Silicon:

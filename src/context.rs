@@ -1,7 +1,7 @@
 //! Per-core context: core table, checkpoint, mappings and block loading.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use bytes::Bytes;
 use compact_encoding::{decode, encode};
@@ -74,7 +74,8 @@ impl Mappings {
 pub(crate) struct Shared {
     pub store: Corestore,
     pub mappings: Mutex<Mappings>,
-    pub other: Mutex<HashMap<[u8; 32], Arc<Context>>>,
+    // Contexts own Shared; the lookup table must not keep its owner alive.
+    pub other: Mutex<HashMap<[u8; 32], Weak<Context>>>,
     pub encryption: Option<crate::EncryptionProvider>,
 }
 
@@ -342,11 +343,12 @@ impl Context {
         }
         let session = self.core(core).await?;
         let key = *session.key();
-        if let Some(ctx) = lock(&self.shared.other).get(&key) {
-            return Ok(ctx.clone());
+        let mut other = lock(&self.shared.other);
+        if let Some(ctx) = other.get(&key).and_then(Weak::upgrade) {
+            return Ok(ctx);
         }
         let ctx = Context::new(self.shared.clone(), session, self.local);
-        lock(&self.shared.other).insert(key, ctx.clone());
+        other.insert(key, Arc::downgrade(&ctx));
         Ok(ctx)
     }
 

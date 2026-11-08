@@ -4,7 +4,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, Weak};
 
 use bytes::Bytes;
 use corestore::{Corestore, GetOptions as StoreGetOptions};
@@ -428,8 +428,11 @@ impl Bee {
         if key == *self.inner.context.core.key() {
             return Ok(self.inner.context.clone());
         }
-        if let Some(context) = lock(&self.inner.shared.other).get(&key) {
-            return Ok(context.clone());
+        if let Some(context) = lock(&self.inner.shared.other)
+            .get(&key)
+            .and_then(Weak::upgrade)
+        {
+            return Ok(context);
         }
         let mut options = StoreGetOptions::key(key);
         options.encryption_key = self
@@ -439,8 +442,12 @@ impl Bee {
             .as_ref()
             .and_then(|provider| provider(&key));
         let session = Arc::new(self.inner.shared.store.get(options).await?);
+        let mut other = lock(&self.inner.shared.other);
+        if let Some(context) = other.get(&key).and_then(Weak::upgrade) {
+            return Ok(context);
+        }
         let context = Context::new(self.inner.shared.clone(), session, self.inner.context.local);
-        lock(&self.inner.shared.other).insert(key, context.clone());
+        other.insert(key, Arc::downgrade(&context));
         Ok(context)
     }
 
@@ -479,5 +486,99 @@ impl Bee {
 
     pub(crate) fn writable(&self) -> bool {
         self.inner.writable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cross_core_contexts_close_with_the_last_bee() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Corestore::open(dir.path()).unwrap();
+        let source = Bee::from_session(
+            &store,
+            Arc::new(store.get(StoreGetOptions::name("source")).await.unwrap()),
+        )
+        .await
+        .unwrap();
+        let mut write = source.batch();
+        for i in 0..64 {
+            write.put(format!("item/{i:03}"), format!("value/{i}"));
+        }
+        write.flush().await.unwrap();
+        let source_key = source.key();
+        let source_core = source.inner.context.core.core().clone();
+
+        let bee = Bee::from_session(
+            &store,
+            Arc::new(store.get(StoreGetOptions::name("view")).await.unwrap()),
+        )
+        .await
+        .unwrap();
+        let local_key = bee.key();
+        let local_core = bee.inner.context.core.core().clone();
+        bee.move_to(source.head().unwrap()).await.unwrap();
+        let mut write = bee.batch();
+        write.put(&b"item/064"[..], &b"value/64"[..]);
+        write.flush().await.unwrap();
+
+        let reader = Bee::open(&store, Some(local_key)).await.unwrap();
+        assert_eq!(
+            reader.get(b"item/000").await.unwrap().unwrap().value,
+            "value/0"
+        );
+        assert_eq!(
+            reader.get(b"item/064").await.unwrap().unwrap().value,
+            "value/64"
+        );
+        let foreign = reader.context_by_key(source_key).await.unwrap();
+        let again = reader.context_by_key(source_key).await.unwrap();
+        assert!(Arc::ptr_eq(&foreign, &again));
+        let unused = store.get(StoreGetOptions::name("unused")).await.unwrap();
+        let unused_key = *unused.key();
+        let unused_core = unused.core().clone();
+        drop(unused);
+        let unused = reader.context_by_key(unused_key).await.unwrap();
+        let expired = Arc::downgrade(&unused);
+        drop(unused);
+        assert_eq!(expired.strong_count(), 0);
+        let reloaded = reader.context_by_key(unused_key).await.unwrap();
+        assert_eq!(*reloaded.core.key(), unused_key);
+        drop(reloaded);
+        assert_eq!(unused_core.session_count(), 0);
+        let shared = [
+            Arc::downgrade(&source.inner.shared),
+            Arc::downgrade(&bee.inner.shared),
+            Arc::downgrade(&reader.inner.shared),
+        ];
+        let contexts = [
+            Arc::downgrade(&reader.inner.context),
+            Arc::downgrade(&foreign),
+        ];
+        drop(again);
+        drop(foreign);
+        drop(reader);
+        drop(bee);
+        drop(source);
+
+        let shared_alive = shared.iter().filter(|weak| weak.strong_count() > 0).count();
+        let contexts_alive = contexts
+            .iter()
+            .filter(|weak| weak.strong_count() > 0)
+            .count();
+        let sessions = source_core.session_count() + local_core.session_count();
+        eprintln!("RETENTION shared={shared_alive} contexts={contexts_alive} sessions={sessions}");
+        assert_eq!(shared_alive, 0, "cross-core cache retains its owner");
+        assert_eq!(
+            contexts_alive, 0,
+            "all tree and context handles were dropped"
+        );
+        assert_eq!(
+            sessions, 0,
+            "cross-core sessions must close without store.close"
+        );
+        store.close().await;
     }
 }
