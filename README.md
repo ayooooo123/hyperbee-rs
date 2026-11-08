@@ -118,3 +118,24 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test -- --include-ignored
 ```
+
+Cold tree inflation shares decoded blocks within one node, then drops that
+temporary cache. It never caches decoded blocks across forks or later reads.
+Apply and lazy tree inflation still share the ordered tree-state lock; snapshots
+share that arena too, so replacing it with a read lock would not make reads safe.
+
+`CATALOG_ENTRIES=10000 cargo test --release --test catalog_perf -- --ignored --nocapture`
+measures three cold catalog lists plus point lookups in isolated synthetic stores
+(32-entry batches, 256-byte values). Three-run release medians on Apple Silicon:
+
+| Entries | List + lookup ms | Allocation calls | Allocated MiB | Process peak RSS MiB |
+| --- | --- | --- | --- | --- |
+| 552 | 6.842 → 1.275 | 26,455 → 5,161 | 38.2 → 3.3 | 17.2 → 11.8 |
+| 560 | 6.774 → 1.248 | 26,762 → 5,230 | 38.4 → 3.4 | 17.3 → 11.8 |
+| 10,000 | 182.788 → 18.932 | 546,968 → 88,495 | 880.4 → 67.7 | 139.2 → 37.8 |
+
+For 10,000 entries the measured read-phase CPU fell from 0.18 to 0.02 seconds;
+the small cases are below the 10 ms CPU-counter resolution. RSS includes fixture
+construction, not just the read phase. These are library workloads, not a live
+channel-follow or application text-search measurement. `CATALOG_WORKERS` selects
+the runtime worker count (default 4).

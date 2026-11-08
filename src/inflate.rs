@@ -1,5 +1,6 @@
 //! Inflating serialized tree deltas into nodes, keyed by `ptr` position.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -9,6 +10,8 @@ use crate::encoding::{Block, EncDelta, KeyData, Loc, OP_COHORT};
 use crate::tree::{
     CompressedArray, Delta, DeltaRef, KeyId, Node, NodeId, PtrId, TreeState, ValuePointer,
 };
+
+type Blocks = HashMap<([u8; 32], u64, u64), Arc<Block>>;
 
 /// Fill `ptr`'s value, reading every block the node references.
 pub(crate) async fn inflate(state: &mut TreeState, ptr: PtrId) -> crate::Result<NodeId> {
@@ -21,7 +24,8 @@ pub(crate) async fn inflate(state: &mut TreeState, ptr: PtrId) -> crate::Result<
     let seq = state.ptrs[ptr].seq;
     let offset = state.ptrs[ptr].offset;
 
-    let block = context.get_block(seq, core, None).await?;
+    let block = Arc::new(context.get_block(seq, core, None).await?);
+    let mut blocks = Blocks::new();
     let base = context.get_loaded_context(core).await?;
     let tree = block
         .tree
@@ -30,11 +34,11 @@ pub(crate) async fn inflate(state: &mut TreeState, ptr: PtrId) -> crate::Result<
 
     let mut keys = Vec::with_capacity(tree.keys.len());
     for d in &tree.keys {
-        keys.push(key_delta(state, &base, d, &block, core, &block).await?);
+        keys.push(key_delta(state, &base, d, &block, core, &mut blocks).await?);
     }
     let mut children = Vec::with_capacity(tree.children.len());
     for d in &tree.children {
-        children.push(child_delta(state, &base, d, &block, core).await?);
+        children.push(child_delta(state, &base, d, &block, core, &mut blocks).await?);
     }
 
     let kid = state.array_id();
@@ -53,15 +57,15 @@ async fn key_delta(
     state: &mut TreeState,
     base: &Arc<Context>,
     d: &EncDelta,
-    origin: &Block,
+    origin: &Arc<Block>,
     origin_core: u64,
-    _current: &Block,
+    blocks: &mut Blocks,
 ) -> crate::Result<Delta<KeyId>> {
     if d.kind == OP_COHORT {
         let co = d
             .ptr
             .ok_or(crate::Error::Message("cohort without pointer"))?;
-        let (cohort_block, _) = load_block(base, co, origin, origin_core).await?;
+        let cohort_block = load_block(base, co, origin, origin_core, blocks).await?;
         let ctx = base.get_loaded_context(co.core).await?;
         let entries = cohort_block
             .cohorts
@@ -71,7 +75,7 @@ async fn key_delta(
         for p in entries {
             let key = match p.ptr {
                 Some(loc) => {
-                    let (target, _) = load_block(&ctx, loc, &cohort_block, co.core).await?;
+                    let target = load_block(&ctx, loc, &cohort_block, co.core, blocks).await?;
                     Some(build_key(state, &ctx, loc, &target).await?)
                 }
                 None => None,
@@ -87,7 +91,7 @@ async fn key_delta(
 
     let key = match d.ptr {
         Some(loc) => {
-            let (target, _) = load_block(base, loc, origin, origin_core).await?;
+            let target = load_block(base, loc, origin, origin_core, blocks).await?;
             Some(build_key(state, base, loc, &target).await?)
         }
         None => None,
@@ -99,14 +103,15 @@ async fn child_delta(
     state: &mut TreeState,
     base: &Arc<Context>,
     d: &EncDelta,
-    origin: &Block,
+    origin: &Arc<Block>,
     origin_core: u64,
+    blocks: &mut Blocks,
 ) -> crate::Result<Delta<PtrId>> {
     if d.kind == OP_COHORT {
         let co = d
             .ptr
             .ok_or(crate::Error::Message("cohort without pointer"))?;
-        let (cohort_block, _) = load_block(base, co, origin, origin_core).await?;
+        let cohort_block = load_block(base, co, origin, origin_core, blocks).await?;
         let ctx = base.get_loaded_context(co.core).await?;
         let entries = cohort_block
             .cohorts
@@ -151,18 +156,24 @@ async fn child_delta(
     Ok(Delta::new(false, d.kind, d.index, ptr.map(DeltaRef::Id)))
 }
 
-/// Resolve a referenced block, reusing `origin` for the same-block fast path.
+/// Reuse decoded blocks only for this node, not across forks or later reads.
 async fn load_block(
     base: &Arc<Context>,
     loc: Loc,
-    origin: &Block,
+    origin: &Arc<Block>,
     origin_core: u64,
-) -> crate::Result<(Block, u64)> {
+    blocks: &mut Blocks,
+) -> crate::Result<Arc<Block>> {
     if loc.core == 0 && loc.seq == origin.seq && origin_core == 0 {
-        return Ok((origin.clone(), 0));
+        return Ok(origin.clone());
     }
-    let block = base.get_block(loc.seq, loc.core, Some(origin)).await?;
-    Ok((block, loc.core))
+    let key = (*base.core.key(), loc.core, loc.seq);
+    if let Some(block) = blocks.get(&key) {
+        return Ok(block.clone());
+    }
+    let block = Arc::new(base.get_block(loc.seq, loc.core, Some(origin)).await?);
+    blocks.insert(key, block.clone());
+    Ok(block)
 }
 
 async fn build_key(
@@ -230,4 +241,48 @@ pub(crate) async fn inflate_value(state: &TreeState, key: KeyId) -> crate::Resul
         }
     }
     Ok(Some(Bytes::from(out)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn same_block_references_share_the_decoded_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = corestore::Corestore::open(dir.path()).unwrap();
+        let bee = crate::Bee::open(&store, None).await.unwrap();
+        let origin = Arc::new(Block {
+            seq: 7,
+            keys: vec![KeyData::default(); 256],
+            ..Default::default()
+        });
+        let loaded = load_block(
+            &bee.inner.context,
+            Loc {
+                seq: 7,
+                ..Default::default()
+            },
+            &origin,
+            0,
+            &mut Blocks::new(),
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(&loaded, &origin));
+
+        let mut write = bee.batch();
+        write.put(&b"key"[..], &b"value"[..]);
+        write.flush().await.unwrap();
+        let mut blocks = Blocks::new();
+        let first = load_block(&bee.inner.context, Loc::default(), &origin, 0, &mut blocks)
+            .await
+            .unwrap();
+        let second = load_block(&bee.inner.context, Loc::default(), &origin, 0, &mut blocks)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(blocks.len(), 1);
+        store.close().await;
+    }
 }
