@@ -17,6 +17,8 @@ use schema::bee;
 
 /// Default B-tree degree. Stored as 0 in blocks.
 pub(crate) const T: u64 = 128;
+/// Largest degree a block may carry; npm has no bound (README deviations).
+pub(crate) const MAX_T: u64 = 4096;
 pub(crate) const TYPE_BLOCK0: u64 = 0;
 pub(crate) const TYPE_LATEST: u64 = 1;
 /// bee1 blocks.
@@ -333,6 +335,9 @@ pub(crate) fn decode_block(buffer: Bytes, seq: u64) -> crate::Result<Block> {
 
 fn decode_block1(buffer: Bytes, seq: u64) -> crate::Result<Block> {
     let block = compact_encoding::decode::<bee::Block1>(buffer)?;
+    if block.t.is_some_and(|t| t > MAX_T) {
+        return Err(Error::Message("tree degree too large"));
+    }
     Ok(Block {
         type_: block.type_,
         seq,
@@ -498,5 +503,19 @@ mod tests {
         assert!(block.tree.is_empty());
         assert_eq!(block.seq, 7);
         assert_eq!(block.t, T);
+    }
+
+    #[test]
+    fn rejects_tree_degree_above_bound() {
+        let block = |t| {
+            encode_block(Block {
+                type_: TYPE_LATEST,
+                t,
+                ..Default::default()
+            })
+        };
+        assert_eq!(decode_block(block(MAX_T), 0).unwrap().t, MAX_T);
+        assert!(decode_block(block(MAX_T + 1), 0).is_err());
+        assert!(decode_block(block(1 << 63), 0).is_err());
     }
 }

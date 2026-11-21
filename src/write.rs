@@ -9,8 +9,11 @@ use crate::context::Context;
 use crate::encoding::{
     Block, EncDelta, KeyData, Loc, Metadata, OP_COHORT, RawTree, T, TYPE_LATEST, ValuePtr,
 };
-use crate::inflate::{inflate, inflate_value};
-use crate::tree::{CompressedArray, Delta, DeltaRef, KeyId, Node, PtrId, TreeState, ValuePointer};
+use crate::inflate::{inflate_value, retain_and_inflate};
+use crate::tree::{
+    CompressedArray, Delta, DeltaRef, KeyId, Locked, MAX_DEPTH, Node, NodeId, PtrId, TreeState,
+    ValuePointer,
+};
 use crate::{Bee, Error, Result};
 
 const PREFERRED_BLOCK_SIZE: usize = 4096;
@@ -51,25 +54,29 @@ impl Batch {
             return Err(Error::NotWritable);
         }
         let inner = self.bee.inner.clone();
-        let mut st = inner.state.lock().await;
-        let result = self.flush_inner(&mut st).await;
-        st.flush_cache();
-        result
+        let _writer = inner.writer.lock().await;
+        let options = self.bee.read_options();
+        crate::READ_OPTIONS
+            .scope(options, async {
+                inner.context.update(true).await?;
+                let mut st = Locked::new(inner.state.clone()).await;
+                let result = self.flush_inner(&mut st).await;
+                st.flush_cache();
+                result
+            })
+            .await
     }
 
-    async fn flush_inner(&mut self, st: &mut TreeState) -> Result<()> {
+    async fn flush_inner(&mut self, st: &mut Locked) -> Result<()> {
         let ctx = self.bee.inner.context.clone();
-        ctx.update(true).await?;
-
-        let mut root = self.bee.root_ptr(st).await?;
+        let mut root = self.bee.root_ptr(st)?;
         let previous = self.bee.head().filter(|head| head.length > 0);
         let length = ctx.core.length();
 
         if root.is_none() {
             let a = st.array_id();
             let b = st.array_id();
-            let node = st.nodes.len();
-            st.nodes.push(Node {
+            let node = st.add_node(Node {
                 t: T,
                 keys: CompressedArray::empty(a),
                 children: CompressedArray::empty(b),
@@ -105,7 +112,7 @@ impl Batch {
 
     async fn flush_write(
         &self,
-        st: &mut TreeState,
+        st: &mut Locked,
         ctx: &Arc<Context>,
         mut root: PtrId,
         length: u64,
@@ -116,7 +123,7 @@ impl Batch {
             return Ok(root);
         }
         if st.ptrs[root].value.is_none() {
-            inflate(st, root).await?;
+            retain_and_inflate(st, root).await?;
         }
 
         let mut values: Vec<KeyId> = Vec::new();
@@ -186,7 +193,8 @@ impl Batch {
             }
         }
 
-        if applied == 0 && length > 0 {
+        // JS tests the root length (`this.length`), not the local core length.
+        if applied == 0 && previous.is_some() {
             return Ok(root);
         }
 
@@ -410,7 +418,7 @@ fn search(st: &TreeState, array: &CompressedArray<KeyId>, key: &[u8]) -> Result<
 }
 
 async fn put(
-    st: &mut TreeState,
+    st: &mut Locked,
     ctx: &Arc<Context>,
     root: &mut PtrId,
     target: Bytes,
@@ -420,7 +428,10 @@ async fn put(
     let mut ptr = *root;
 
     loop {
-        let node = inflate(st, ptr).await?;
+        if stack.len() >= MAX_DEPTH {
+            return Err(Error::Message("tree too deep"));
+        }
+        let node = retain_and_inflate(st, ptr).await?;
         let has_children = st.nodes[node].children.ulength() > 0;
         if !has_children {
             break;
@@ -445,7 +456,7 @@ async fn put(
             .ok_or(Error::Message("child index out of range"))?;
     }
 
-    let node = inflate(st, ptr).await?;
+    let node = retain_and_inflate(st, ptr).await?;
     let status = insert_leaf(st, node, ctx, target.clone(), value.clone())?;
     if let Status::Existing(index) = status {
         let kid = st.nodes[node]
@@ -474,15 +485,14 @@ async fn put(
         let (median, right) = split(st, ptr, ctx)?;
         match stack.pop() {
             Some(parent) => {
-                let pnode = inflate(st, parent).await?;
+                let pnode = retain_and_inflate(st, parent).await?;
                 status = insert_node(st, pnode, median, right)?;
                 ptr = parent;
             }
             None => {
                 let a = st.array_id();
                 let b = st.array_id();
-                let node_id = st.nodes.len();
-                st.nodes.push(Node {
+                let node_id = st.add_node(Node {
                     t: new_t,
                     keys: CompressedArray::empty(a),
                     children: CompressedArray::empty(b),
@@ -499,7 +509,7 @@ async fn put(
     Ok(true)
 }
 
-async fn existing_value(st: &TreeState, key: KeyId) -> Result<Option<Bytes>> {
+async fn existing_value(st: &mut Locked, key: KeyId) -> Result<Option<Bytes>> {
     if let Some(v) = &st.keys[key].value {
         return Ok(Some(v.clone()));
     }
@@ -508,7 +518,7 @@ async fn existing_value(st: &TreeState, key: KeyId) -> Result<Option<Bytes>> {
 
 fn set_value(
     st: &mut TreeState,
-    node: usize,
+    node: NodeId,
     ctx: &Arc<Context>,
     index: usize,
     key: Bytes,
@@ -521,7 +531,7 @@ fn set_value(
 
 fn insert_leaf(
     st: &mut TreeState,
-    node: usize,
+    node: NodeId,
     ctx: &Arc<Context>,
     key: Bytes,
     value: Bytes,
@@ -541,7 +551,7 @@ fn insert_leaf(
     })
 }
 
-fn insert_node(st: &mut TreeState, node: usize, key: KeyId, child: PtrId) -> Result<Status> {
+fn insert_node(st: &mut TreeState, node: NodeId, key: KeyId, child: PtrId) -> Result<Status> {
     let max_keys = 2 * st.nodes[node].t as usize - 1;
     let (found, s, e, c) = search(st, &st.nodes[node].keys, &st.keys[key].key)?;
     if let Some((mid, _)) = found {
@@ -566,8 +576,7 @@ fn split(st: &mut TreeState, ptr: PtrId, ctx: &Arc<Context>) -> Result<(KeyId, P
 
     let a = st.array_id();
     let b = st.array_id();
-    let right_node = st.nodes.len();
-    st.nodes.push(Node {
+    let right_node = st.add_node(Node {
         t,
         keys: CompressedArray::empty(a),
         children: CompressedArray::empty(b),
@@ -609,17 +618,15 @@ fn split(st: &mut TreeState, ptr: PtrId, ctx: &Arc<Context>) -> Result<(KeyId, P
     Ok((median, right))
 }
 
-async fn delete(
-    st: &mut TreeState,
-    ctx: &Arc<Context>,
-    root: &mut PtrId,
-    key: &[u8],
-) -> Result<bool> {
+async fn delete(st: &mut Locked, ctx: &Arc<Context>, root: &mut PtrId, key: &[u8]) -> Result<bool> {
     let mut ptr = *root;
     let mut stack = Vec::new();
 
     loop {
-        let node = inflate(st, ptr).await?;
+        if stack.len() >= MAX_DEPTH {
+            return Err(Error::Message("tree too deep"));
+        }
+        let node = retain_and_inflate(st, ptr).await?;
         stack.push(ptr);
         let (found, s, e, c) = search(st, &st.nodes[node].keys, key)?;
         if let Some((mid, _)) = found {
@@ -646,8 +653,8 @@ async fn delete(
 }
 
 async fn set_key_to_nearest_leaf(
-    st: &mut TreeState,
-    parent: usize,
+    st: &mut Locked,
+    parent: NodeId,
     index: usize,
     stack: &mut Vec<PtrId>,
     _ctx: &Arc<Context>,
@@ -666,8 +673,11 @@ async fn set_key_to_nearest_leaf(
 
     if ls < rs {
         stack.push(right);
-        let mut node = inflate(st, right).await?;
+        let mut node = retain_and_inflate(st, right).await?;
         loop {
+            if stack.len() >= MAX_DEPTH {
+                return Err(Error::Message("tree too deep"));
+            }
             if st.nodes[node].children.ulength() == 0 {
                 break;
             }
@@ -676,7 +686,7 @@ async fn set_key_to_nearest_leaf(
                 .uget(0)
                 .ok_or(Error::Message("missing first child"))?;
             stack.push(child);
-            node = inflate(st, child).await?;
+            node = retain_and_inflate(st, child).await?;
         }
         let key = st.nodes[node]
             .keys
@@ -685,8 +695,11 @@ async fn set_key_to_nearest_leaf(
         st.nodes[parent].keys.set(index, key);
     } else {
         stack.push(left);
-        let mut node = inflate(st, left).await?;
+        let mut node = retain_and_inflate(st, left).await?;
         loop {
+            if stack.len() >= MAX_DEPTH {
+                return Err(Error::Message("tree too deep"));
+            }
             if st.nodes[node].children.ulength() == 0 {
                 break;
             }
@@ -696,7 +709,7 @@ async fn set_key_to_nearest_leaf(
                 .uget(last)
                 .ok_or(Error::Message("missing last child"))?;
             stack.push(child);
-            node = inflate(st, child).await?;
+            node = retain_and_inflate(st, child).await?;
         }
         let key = st.nodes[node]
             .keys
@@ -707,9 +720,9 @@ async fn set_key_to_nearest_leaf(
     Ok(())
 }
 
-async fn leaf_size(st: &mut TreeState, mut ptr: PtrId, go_left: bool) -> Result<usize> {
-    loop {
-        let node = inflate(st, ptr).await?;
+async fn leaf_size(st: &mut Locked, mut ptr: PtrId, go_left: bool) -> Result<usize> {
+    for _ in 0..MAX_DEPTH {
+        let node = retain_and_inflate(st, ptr).await?;
         let len = st.nodes[node].children.ulength();
         if len == 0 {
             return Ok(st.nodes[node].keys.ulength());
@@ -720,9 +733,10 @@ async fn leaf_size(st: &mut TreeState, mut ptr: PtrId, go_left: bool) -> Result<
             .uget(i)
             .ok_or(Error::Message("missing child"))?;
     }
+    Err(Error::Message("tree too deep"))
 }
 
-fn remove_key(st: &mut TreeState, node: usize, index: usize) {
+fn remove_key(st: &mut TreeState, node: NodeId, index: usize) {
     st.nodes[node].keys.delete(index);
     if st.nodes[node].children.ulength() > 0 {
         st.nodes[node].children.delete(index + 1);
@@ -731,8 +745,8 @@ fn remove_key(st: &mut TreeState, node: usize, index: usize) {
 
 fn siblings(
     st: &TreeState,
-    parent: usize,
-    node: usize,
+    parent: NodeId,
+    node: NodeId,
 ) -> Result<(Option<PtrId>, usize, Option<PtrId>)> {
     let len = st.nodes[parent].children.ulength();
     let list: Vec<PtrId> = (0..len)
@@ -750,18 +764,22 @@ fn siblings(
     ))
 }
 
-fn merge(st: &mut TreeState, left: usize, right: usize, median: KeyId) {
-    let right_node = st.ptrs[right].value.expect("right node");
-    let mut keys = Vec::new();
-    for i in 0..st.nodes[right_node].keys.ulength() {
-        keys.push(st.nodes[right_node].keys.uget(i).expect("key"));
-    }
-    let mut children = Vec::new();
-    for i in 0..st.nodes[right_node].children.ulength() {
-        children.push(st.nodes[right_node].children.uget(i).expect("child"));
-    }
+fn merge(st: &mut TreeState, left: PtrId, right: PtrId, median: KeyId) -> Result<()> {
+    let right_node = st.ptrs[right]
+        .value
+        .ok_or(Error::Message("malformed node"))?;
+    let keys = (0..st.nodes[right_node].keys.ulength())
+        .map(|i| st.nodes[right_node].keys.uget(i))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(Error::Message("malformed node"))?;
+    let children = (0..st.nodes[right_node].children.ulength())
+        .map(|i| st.nodes[right_node].children.uget(i))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(Error::Message("malformed node"))?;
 
-    let left_node = st.ptrs[left].value.expect("left node");
+    let left_node = st.ptrs[left]
+        .value
+        .ok_or(Error::Message("malformed node"))?;
     st.nodes[left_node].keys.push(median);
     for k in keys {
         st.nodes[left_node].keys.push(k);
@@ -769,26 +787,27 @@ fn merge(st: &mut TreeState, left: usize, right: usize, median: KeyId) {
     for c in children {
         st.nodes[left_node].children.push(c);
     }
+    Ok(())
 }
 
-async fn rebalance(st: &mut TreeState, mut stack: Vec<PtrId>) -> Result<PtrId> {
+async fn rebalance(st: &mut Locked, mut stack: Vec<PtrId>) -> Result<PtrId> {
     let root = stack[0];
 
     while stack.len() > 1 {
         let ptr = stack.pop().expect("non-empty");
         let parent = *stack.last().expect("non-empty");
 
-        let node = inflate(st, ptr).await?;
+        let node = retain_and_inflate(st, ptr).await?;
         let min_keys = st.nodes[node].t as usize - 1;
         if st.nodes[node].keys.ulength() >= min_keys {
             return Ok(root);
         }
 
-        let pnode = inflate(st, parent).await?;
+        let pnode = retain_and_inflate(st, parent).await?;
         let (left, mut index, right) = siblings(st, pnode, node)?;
 
         if let Some(left) = left {
-            let l = inflate(st, left).await?;
+            let l = retain_and_inflate(st, left).await?;
             if st.nodes[l].keys.ulength() > min_keys {
                 st.mark(left);
                 let key = st.nodes[pnode]
@@ -797,7 +816,10 @@ async fn rebalance(st: &mut TreeState, mut stack: Vec<PtrId>) -> Result<PtrId> {
                     .ok_or(Error::Message("missing left separator"))?;
                 st.nodes[node].keys.unshift(key);
                 if st.nodes[l].children.ulength() > 0 {
-                    let child = st.nodes[l].children.pop().expect("child");
+                    let child = st.nodes[l]
+                        .children
+                        .pop()
+                        .ok_or(Error::Message("malformed node"))?;
                     st.nodes[node].children.unshift(child);
                 }
                 let moved = st.nodes[l].keys.pop().ok_or(Error::Message("empty left"))?;
@@ -807,7 +829,7 @@ async fn rebalance(st: &mut TreeState, mut stack: Vec<PtrId>) -> Result<PtrId> {
         }
 
         if let Some(right) = right {
-            let r = inflate(st, right).await?;
+            let r = retain_and_inflate(st, right).await?;
             if st.nodes[r].keys.ulength() > min_keys {
                 st.mark(right);
                 let key = st.nodes[pnode]
@@ -816,7 +838,10 @@ async fn rebalance(st: &mut TreeState, mut stack: Vec<PtrId>) -> Result<PtrId> {
                     .ok_or(Error::Message("missing right separator"))?;
                 st.nodes[node].keys.push(key);
                 if st.nodes[r].children.ulength() > 0 {
-                    let child = st.nodes[r].children.shift().expect("child");
+                    let child = st.nodes[r]
+                        .children
+                        .shift()
+                        .ok_or(Error::Message("malformed node"))?;
                     st.nodes[node].children.push(child);
                 }
                 let moved = st.nodes[r]
@@ -832,7 +857,7 @@ async fn rebalance(st: &mut TreeState, mut stack: Vec<PtrId>) -> Result<PtrId> {
             index -= 1;
             (left, ptr)
         } else {
-            (ptr, right.expect("one sibling exists"))
+            (ptr, right.ok_or(Error::Message("malformed node"))?)
         };
 
         st.mark(left);
@@ -840,14 +865,17 @@ async fn rebalance(st: &mut TreeState, mut stack: Vec<PtrId>) -> Result<PtrId> {
             .keys
             .uget(index)
             .ok_or(Error::Message("missing merge separator"))?;
-        merge(st, left, right, median);
+        merge(st, left, right, median)?;
         st.mark(parent);
         remove_key(st, pnode, index);
     }
 
-    let r = inflate(st, root).await?;
+    let r = retain_and_inflate(st, root).await?;
     if st.nodes[r].keys.ulength() == 0 && st.nodes[r].children.ulength() > 0 {
-        return Ok(st.nodes[r].children.uget(0).expect("child"));
+        return st.nodes[r]
+            .children
+            .uget(0)
+            .ok_or(Error::Message("malformed node"));
     }
     Ok(root)
 }
@@ -861,8 +889,7 @@ fn commit(st: &mut TreeState, ptr: PtrId) -> Result<PtrId> {
     let b = st.array_id();
     let keys = st.nodes[node].keys.commit(a);
     let children = st.nodes[node].children.commit(b);
-    let new_node = st.nodes.len();
-    st.nodes.push(Node { t, keys, children });
+    let new_node = st.add_node(Node { t, keys, children });
     let context = st.ptrs[ptr].context.clone();
     let core = st.ptrs[ptr].core;
     let new_ptr = st.add_ptr(context, core, 0, 0, true, Some(new_node));
@@ -1016,4 +1043,58 @@ fn relocate_ptr(st: &mut TreeState, ctx: &Arc<Context>, ptr: PtrId) -> Result<()
         st.ptrs[ptr].context = ctx.clone();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use corestore::Corestore;
+
+    use crate::Bee;
+
+    /// Writes on evicted and re-inflated nodes produce the same blocks as
+    /// writes on nodes that stayed in memory.
+    #[tokio::test]
+    async fn evicted_nodes_write_the_same_blocks() {
+        let mut cores = Vec::new();
+        let mut dirs = Vec::new();
+        for max_nodes in [2, crate::tree::NODE_CACHE_SIZE] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Corestore::open_with_primary_key(dir.path(), [7; 32]).unwrap();
+            let bee = Bee::open(&store, None).await.unwrap();
+            bee.inner.state.lock().await.max_nodes = max_nodes;
+            let mut seed = 1u64;
+            for round in 0..6 {
+                let mut batch = bee.batch();
+                for _ in 0..800 {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let key = format!("key/{:04}", (seed >> 33) % 3000);
+                    if round > 1 && seed.is_multiple_of(3) {
+                        batch.del(key);
+                    } else {
+                        batch.put(
+                            key,
+                            format!("value/{round}/{}", "x".repeat((seed % 1500) as usize)),
+                        );
+                    }
+                }
+                batch.flush().await.unwrap();
+                let live = bee.inner.state.lock().await.nodes.len();
+                assert!(live <= max_nodes, "{live} nodes after flush");
+            }
+            let core = bee.inner.context.core.clone();
+            let mut blocks = Vec::new();
+            for seq in 0..core.length() {
+                blocks.push(core.get(seq, Default::default()).await.unwrap().unwrap());
+            }
+            cores.push(blocks);
+            dirs.push((dir, store));
+        }
+        assert!(cores[0].len() > 6);
+        assert_eq!(cores[0], cores[1]);
+        for (_, store) in dirs {
+            store.close().await;
+        }
+    }
 }

@@ -1,4 +1,9 @@
 //! Inflating serialized tree deltas into nodes, keyed by `ptr` position.
+//!
+//! Inflation has two phases, as in `lib/inflate.js`: the blocks a node
+//! references are read and decoded without the tree lock, under the caller's
+//! read options; the node is then installed under the lock, unless another
+//! caller installed it first.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,25 +13,78 @@ use bytes::Bytes;
 use crate::context::Context;
 use crate::encoding::{Block, EncDelta, KeyData, Loc, OP_COHORT};
 use crate::tree::{
-    CompressedArray, Delta, DeltaRef, KeyId, Node, NodeId, PtrId, TreeState, ValuePointer,
+    CompressedArray, Delta, DeltaRef, KeyId, Locked, Node, NodeId, PtrId, TreeState, ValuePointer,
 };
 
 type Blocks = HashMap<([u8; 32], u64, u64), Arc<Block>>;
 
-/// Fill `ptr`'s value, reading every block the node references.
-pub(crate) async fn inflate(state: &mut TreeState, ptr: PtrId) -> crate::Result<NodeId> {
-    if let Some(node) = state.ptrs[ptr].value {
-        return Ok(node);
+/// A key decoded from its block, not yet in the arena.
+struct KeySpec {
+    context: Arc<Context>,
+    loc: Loc,
+    key: Bytes,
+    value: Option<Bytes>,
+    value_ptr: Option<ValuePointer>,
+}
+
+/// A child location in the context it was decoded from.
+type ChildSpec = (Arc<Context>, Loc);
+
+/// Everything a node needs, read without the tree lock.
+struct Fetched {
+    base: Arc<Context>,
+    /// Fork of the node's core before its block was read.
+    fork: u64,
+    t: u64,
+    keys: Vec<Delta<KeySpec>>,
+    children: Vec<Delta<ChildSpec>>,
+}
+
+/// Fill `ptr`'s value for a reader, reading every block the node references
+/// with the tree unlocked. If `ptr`'s slot was freed meanwhile, `ptr` is
+/// re-created from its location. If the core forked during the read, the
+/// bytes may be of the old fork and are read again.
+pub(crate) async fn inflate(st: &mut Locked, ptr: &mut PtrId) -> crate::Result<NodeId> {
+    loop {
+        if let Some(node) = st.ptrs[*ptr].value {
+            st.touch(*ptr);
+            return Ok(node);
+        }
+        let mut at = st.ptr_ref(*ptr);
+        let fetched = st
+            .unlocked(fetch(at.context.clone(), at.core, at.seq, at.offset))
+            .await?;
+        // Drop cache entries of an old fork before re-creating `ptr`.
+        st.check_fork(&fetched.base.core);
+        *ptr = st.resolve(&mut at)?;
+        if fetched.base.core.fork() == fetched.fork {
+            return install(st, *ptr, fetched);
+        }
     }
+}
 
-    let context = state.ptrs[ptr].context.clone();
-    let core = state.ptrs[ptr].core;
-    let seq = state.ptrs[ptr].seq;
-    let offset = state.ptrs[ptr].offset;
+/// Writer inflation, JS `retainAndInflate`: the pointer and its node stay in
+/// the arena until the batch flushes, so ids a write holds stay valid.
+pub(crate) async fn retain_and_inflate(st: &mut Locked, ptr: PtrId) -> crate::Result<NodeId> {
+    st.retain(ptr);
+    let mut id = ptr;
+    let node = inflate(st, &mut id).await?;
+    if id != ptr {
+        // A retained pointer is never freed; refuse to write through a copy.
+        return Err(crate::Error::Message("retained pointer was freed"));
+    }
+    Ok(node)
+}
 
+async fn fetch(context: Arc<Context>, core: u64, seq: u64, offset: u64) -> crate::Result<Fetched> {
+    // What `get_block` does first, so the core's fork can be read before the block.
+    if !context.has_core(core) {
+        context.update_maybe(core, None).await?;
+    }
+    let base = context.get_loaded_context(core).await?;
+    let fork = base.core.fork();
     let block = Arc::new(context.get_block(seq, core, None).await?);
     let mut blocks = Blocks::new();
-    let base = context.get_loaded_context(core).await?;
     let tree = block
         .tree
         .get(offset as usize)
@@ -34,33 +92,93 @@ pub(crate) async fn inflate(state: &mut TreeState, ptr: PtrId) -> crate::Result<
 
     let mut keys = Vec::with_capacity(tree.keys.len());
     for d in &tree.keys {
-        keys.push(key_delta(state, &base, d, &block, core, &mut blocks).await?);
+        keys.push(key_delta(&base, d, &block, core, &mut blocks).await?);
     }
     let mut children = Vec::with_capacity(tree.children.len());
     for d in &tree.children {
-        children.push(child_delta(state, &base, d, &block, core, &mut blocks).await?);
+        children.push(child_delta(&base, d, &block, core, &mut blocks).await?);
+    }
+    Ok(Fetched {
+        base,
+        fork,
+        t: block.t,
+        keys,
+        children,
+    })
+}
+
+/// Build the node of `ptr` from fetched data, unless it is already there.
+fn install(st: &mut TreeState, ptr: PtrId, fetched: Fetched) -> crate::Result<NodeId> {
+    st.check_fork(&fetched.base.core);
+    if let Some(node) = st.ptrs[ptr].value {
+        st.touch(ptr);
+        return Ok(node);
+    }
+    let mut keys = Vec::with_capacity(fetched.keys.len());
+    for d in fetched.keys {
+        keys.push(map_delta(d, &mut |k: KeySpec| {
+            Ok(st.add_key(
+                k.context,
+                k.loc.core,
+                k.loc.seq,
+                k.loc.offset,
+                false,
+                k.key,
+                k.value,
+                k.value_ptr,
+            ))
+        })?);
+    }
+    let mut children = Vec::with_capacity(fetched.children.len());
+    for d in fetched.children {
+        children.push(map_delta(d, &mut |(ctx, loc): ChildSpec| {
+            st.create_ptr(ctx, loc.core, loc.seq, loc.offset, false, None)
+        })?);
     }
 
-    let kid = state.array_id();
-    let cid = state.array_id();
-    let node = state.nodes.len();
-    state.nodes.push(Node {
-        t: block.t,
+    let kid = st.array_id();
+    let cid = st.array_id();
+    let node = st.add_node(Node {
+        t: fetched.t,
         keys: CompressedArray::from_delta(keys, kid),
         children: CompressedArray::from_delta(children, cid),
     });
-    state.ptrs[ptr].value = Some(node);
+    st.ptrs[ptr].value = Some(node);
+    // Collect before the new node enters the cache, so it is never the one dropped.
+    st.gc();
+    st.touch(ptr);
     Ok(node)
 }
 
+fn map_delta<A, B>(
+    d: Delta<A>,
+    f: &mut impl FnMut(A) -> crate::Result<B>,
+) -> crate::Result<Delta<B>> {
+    let ptr = match d.ptr {
+        Some(DeltaRef::Id(a)) => Some(DeltaRef::Id(f(a)?)),
+        Some(DeltaRef::Loc(context, loc)) => Some(DeltaRef::Loc(context, loc)),
+        None => None,
+    };
+    let mut cohort = Vec::with_capacity(d.cohort.len());
+    for dd in d.cohort {
+        cohort.push(map_delta(dd, f)?);
+    }
+    Ok(Delta {
+        changed: d.changed,
+        kind: d.kind,
+        index: d.index,
+        ptr,
+        cohort,
+    })
+}
+
 async fn key_delta(
-    state: &mut TreeState,
     base: &Arc<Context>,
     d: &EncDelta,
     origin: &Arc<Block>,
     origin_core: u64,
     blocks: &mut Blocks,
-) -> crate::Result<Delta<KeyId>> {
+) -> crate::Result<Delta<KeySpec>> {
     if d.kind == OP_COHORT {
         let co = d
             .ptr
@@ -76,7 +194,7 @@ async fn key_delta(
             let key = match p.ptr {
                 Some(loc) => {
                     let target = load_block(&ctx, loc, &cohort_block, co.core, blocks).await?;
-                    Some(build_key(state, &ctx, loc, &target).await?)
+                    Some(build_key(&ctx, loc, &target).await?)
                 }
                 None => None,
             };
@@ -92,7 +210,7 @@ async fn key_delta(
     let key = match d.ptr {
         Some(loc) => {
             let target = load_block(base, loc, origin, origin_core, blocks).await?;
-            Some(build_key(state, base, loc, &target).await?)
+            Some(build_key(base, loc, &target).await?)
         }
         None => None,
     };
@@ -100,13 +218,12 @@ async fn key_delta(
 }
 
 async fn child_delta(
-    state: &mut TreeState,
     base: &Arc<Context>,
     d: &EncDelta,
     origin: &Arc<Block>,
     origin_core: u64,
     blocks: &mut Blocks,
-) -> crate::Result<Delta<PtrId>> {
+) -> crate::Result<Delta<ChildSpec>> {
     if d.kind == OP_COHORT {
         let co = d
             .ptr
@@ -119,23 +236,16 @@ async fn child_delta(
             .ok_or(crate::Error::Message("cohort offset out of range"))?;
         let mut deltas = Vec::with_capacity(entries.len());
         for p in entries {
-            let ptr = match p.ptr {
+            let child = match p.ptr {
                 Some(loc) => {
                     if !ctx.has_core(loc.core) {
                         ctx.update_maybe(loc.core, Some(&cohort_block)).await?;
                     }
-                    Some(state.create_ptr(
-                        ctx.clone(),
-                        loc.core,
-                        loc.seq,
-                        loc.offset,
-                        false,
-                        None,
-                    )?)
+                    Some(DeltaRef::Id((ctx.clone(), loc)))
                 }
                 None => None,
             };
-            deltas.push(Delta::new(false, p.kind, p.index, ptr.map(DeltaRef::Id)));
+            deltas.push(Delta::new(false, p.kind, p.index, child));
         }
         return Ok(Delta::cohort(
             false,
@@ -144,16 +254,16 @@ async fn child_delta(
         ));
     }
 
-    let ptr = match d.ptr {
+    let child = match d.ptr {
         Some(loc) => {
             if !base.has_core(loc.core) {
                 base.update_maybe(loc.core, Some(origin)).await?;
             }
-            Some(state.create_ptr(base.clone(), loc.core, loc.seq, loc.offset, false, None)?)
+            Some(DeltaRef::Id((base.clone(), loc)))
         }
         None => None,
     };
-    Ok(Delta::new(false, d.kind, d.index, ptr.map(DeltaRef::Id)))
+    Ok(Delta::new(false, d.kind, d.index, child))
 }
 
 /// Reuse decoded blocks only for this node, not across forks or later reads.
@@ -176,12 +286,7 @@ async fn load_block(
     Ok(block)
 }
 
-async fn build_key(
-    state: &mut TreeState,
-    base: &Arc<Context>,
-    loc: Loc,
-    target: &Block,
-) -> crate::Result<KeyId> {
+async fn build_key(base: &Arc<Context>, loc: Loc, target: &Block) -> crate::Result<KeySpec> {
     let data: &KeyData = target
         .keys
         .get(loc.offset as usize)
@@ -194,28 +299,29 @@ async fn build_key(
         offset: p.offset,
         split: p.split,
     });
-    Ok(state.add_key(
-        base.clone(),
-        loc.core,
-        loc.seq,
-        loc.offset,
-        false,
-        data.key.clone(),
-        data.value.clone(),
+    Ok(KeySpec {
+        context: base.clone(),
+        loc,
+        key: data.key.clone(),
+        value: data.value.clone(),
         value_ptr,
-    ))
+    })
 }
 
-/// Read a key's value, following external value pointers.
-pub(crate) async fn inflate_value(state: &TreeState, key: KeyId) -> crate::Result<Option<Bytes>> {
-    let k = &state.keys[key];
+/// Read a key's value, following external value pointers with the tree
+/// unlocked. Readers copy what they need from `key` before calling.
+pub(crate) async fn inflate_value(st: &mut Locked, key: KeyId) -> crate::Result<Option<Bytes>> {
+    let k = &st.keys[key];
     if let Some(v) = &k.value {
         return Ok(Some(v.clone()));
     }
-    let Some(vp) = &k.value_ptr else {
+    let Some(vp) = k.value_ptr.clone() else {
         return Ok(None);
     };
+    st.unlocked(fetch_value(vp)).await
+}
 
+async fn fetch_value(vp: ValuePointer) -> crate::Result<Option<Bytes>> {
     if vp.split == 0 {
         let block = vp.context.get_block(vp.seq, vp.core, None).await?;
         return Ok(block.values.get(vp.offset as usize).cloned());
@@ -223,12 +329,13 @@ pub(crate) async fn inflate_value(state: &TreeState, key: KeyId) -> crate::Resul
 
     // A split value is the first value of `split` blocks followed by the tail
     // of the last one, starting at `offset`.
+    let first_seq = vp
+        .seq
+        .checked_sub(vp.split)
+        .ok_or(crate::Error::Message("value split before core start"))?;
     let mut out = Vec::new();
     for i in 0..=vp.split {
-        let block = vp
-            .context
-            .get_block(vp.seq - vp.split + i, vp.core, None)
-            .await?;
+        let block = vp.context.get_block(first_seq + i, vp.core, None).await?;
         let first = block
             .values
             .first()

@@ -179,10 +179,7 @@ fn decode_index(buf: &[u8]) -> crate::Result<Index> {
             1 => {
                 let (len, n) = varint(buf, offset)?;
                 offset = n;
-                let end = offset + len as usize;
-                if end > buf.len() {
-                    return Err(crate::Error::Message("invalid compat index"));
-                }
+                let end = checked(buf, offset, len as usize)?;
                 out.levels.push(decode_level(&buf[offset..end])?);
                 offset = end;
             }
@@ -202,10 +199,7 @@ fn decode_level(buf: &[u8]) -> crate::Result<Level> {
             1 => {
                 let (len, n) = varint(buf, offset)?;
                 offset = n;
-                let end = offset + len as usize;
-                if end > buf.len() {
-                    return Err(crate::Error::Message("invalid compat level"));
-                }
+                let end = checked(buf, offset, len as usize)?;
                 while offset < end {
                     let (v, n) = varint(buf, offset)?;
                     offset = n;
@@ -215,10 +209,7 @@ fn decode_level(buf: &[u8]) -> crate::Result<Level> {
             2 => {
                 let (len, n) = varint(buf, offset)?;
                 offset = n;
-                let end = offset + len as usize;
-                if end > buf.len() {
-                    return Err(crate::Error::Message("invalid compat level"));
-                }
+                let end = checked(buf, offset, len as usize)?;
                 while offset < end {
                     let (v, n) = varint(buf, offset)?;
                     offset = n;
@@ -277,4 +268,24 @@ fn checked(buf: &[u8], offset: usize, n: usize) -> crate::Result<usize> {
         .checked_add(n)
         .filter(|end| *end <= buf.len())
         .ok_or(crate::Error::Message("truncated compat block"))
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    #[test]
+    fn index_length_overflow_is_an_error() {
+        // Type 10 node: index = { level, length 2^64-1 }, empty key.
+        let block = Bytes::from_static(&[
+            0x0a, 0x0b, 0x0a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x12,
+            0x00,
+        ]);
+        assert!(crate::encoding::decode_block(block, 3).is_err());
+        // The review's 13-byte sample fails earlier, at the node frame.
+        let sample = Bytes::from_static(&[
+            0x0a, 0x0a, 0x0a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01,
+        ]);
+        assert!(crate::encoding::decode_block(sample, 3).is_err());
+    }
 }

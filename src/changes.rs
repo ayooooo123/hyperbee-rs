@@ -42,7 +42,7 @@ impl ChangesStream {
             window: None,
             window_core: None,
             window_start: 0,
-            read_options: crate::ReadOptions::default(),
+            read_options: bee.read_options(),
         })
     }
 
@@ -105,11 +105,15 @@ impl ChangesStream {
             });
         }
         let tail = if let Some(previous) = last.previous {
+            let length = previous
+                .seq
+                .checked_add(1)
+                .ok_or(Error::Message("invalid previous seq"))?;
             context.update_maybe(previous.core, Some(&last)).await?;
             let next = context.get_loaded_context(previous.core).await?;
             let tail = Head {
                 key: *next.core.key(),
-                length: previous.seq + 1,
+                length,
             };
             self.context = Some(next);
             Some(tail)

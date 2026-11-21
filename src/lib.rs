@@ -29,7 +29,7 @@ pub use reindex::ValueMap;
 pub use write::Batch;
 
 use context::{Context, Mappings, Shared};
-use tree::{KeyId, Node, PtrId, TreeState};
+use tree::{KeyId, Locked, Node, PtrId, TreeState};
 
 fn lock<T>(m: &StdMutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -156,9 +156,14 @@ pub(crate) struct BeeInner {
     pub shared: Arc<Shared>,
     pub context: Arc<Context>,
     pub state: Arc<AsyncMutex<TreeState>>,
+    /// Serializes batches, reindex and root moves on one tree, like JS
+    /// `context.lock`; taken before `state`. Readers never take it.
+    pub writer: Arc<AsyncMutex<()>>,
     pub root: StdMutex<RootState>,
     pub writable: bool,
     pub view: bool,
+    /// Read options for calls that pass none; see `set_default_read_options`.
+    pub read_options: StdMutex<ReadOptions>,
 }
 
 /// A hyperbee. Cheap to clone: clones share the tree and storage.
@@ -201,9 +206,11 @@ impl Bee {
             shared,
             context: context.clone(),
             state,
+            writer: Arc::new(AsyncMutex::new(())),
             root: StdMutex::new(RootState::default()),
             writable: session.writable(),
             view: false,
+            read_options: StdMutex::new(ReadOptions::default()),
         });
         let bee = Bee { inner };
         bee.set_root_from_core().await?;
@@ -213,6 +220,7 @@ impl Bee {
     async fn set_root_from_core(&self) -> Result<()> {
         let length = self.inner.context.core.length();
         let mut st = self.inner.state.lock().await;
+        st.check_fork(&self.inner.context.core);
         let ptr = if length == 0 {
             None
         } else {
@@ -252,18 +260,23 @@ impl Bee {
         (root.loaded, root.loc)
     }
 
-    pub(crate) async fn root_ptr(&self, st: &mut TreeState) -> Result<Option<PtrId>> {
+    /// The root pointer, created again from the root location if its slot
+    /// was freed by the node cache.
+    pub(crate) fn root_ptr(&self, st: &mut TreeState) -> Result<Option<PtrId>> {
         let (loaded, loc) = self.root_loc();
         if !loaded {
             return Ok(None);
         }
-        if let Some(ptr) = lock(&self.inner.root).ptr {
+        if let Some(ptr) = lock(&self.inner.root).ptr
+            && st.has_ptr(ptr)
+        {
             return Ok(Some(ptr));
         }
         let Some((core, seq, offset)) = loc else {
             return Ok(None);
         };
         let context = self.context();
+        st.check_fork(&context.core);
         let ptr = st.create_ptr(context, core, seq, offset, false, None)?;
         lock(&self.inner.root).ptr = Some(ptr);
         Ok(Some(ptr))
@@ -287,9 +300,20 @@ impl Bee {
         root.key = key;
     }
 
+    /// Read options used by calls that pass none: `get`, `range`, `changes`,
+    /// batch flushes, `cores` and `reindex`. `checkout` and `snapshot`
+    /// handles start with the options of the handle they come from.
+    pub fn set_default_read_options(&self, options: ReadOptions) {
+        *lock(&self.inner.read_options) = options;
+    }
+
+    pub(crate) fn read_options(&self) -> ReadOptions {
+        lock(&self.inner.read_options).clone()
+    }
+
     /// JS `get`.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Entry>> {
-        self.get_with_options(key, ReadOptions::default()).await
+        self.get_with_options(key, self.read_options()).await
     }
 
     /// Get with Hypercore timeout, wait and request options.
@@ -302,13 +326,13 @@ impl Bee {
     }
 
     async fn get_inner(&self, key: &[u8]) -> Result<Option<Entry>> {
-        let mut st = self.inner.state.lock().await;
-        let Some(mut ptr) = self.root_ptr(&mut st).await? else {
+        let mut st = Locked::new(self.inner.state.clone()).await;
+        let Some(mut ptr) = self.root_ptr(&mut st)? else {
             return Ok(None);
         };
 
-        loop {
-            let node = inflate::inflate(&mut st, ptr).await?;
+        for _ in 0..tree::MAX_DEPTH {
+            let node = inflate::inflate(&mut st, &mut ptr).await?;
             let (found, s, e, cmp) = {
                 let n = &st.nodes[node];
                 search_node(&st, n, key)?
@@ -316,14 +340,8 @@ impl Bee {
             let has_children = st.nodes[node].children.length() > 0;
 
             if let Some(kid) = found {
-                let (seq, key, value) = {
-                    let k = &st.keys[kid];
-                    let value = match &k.value {
-                        Some(v) => Some(v.clone()),
-                        None => inflate::inflate_value(&st, kid).await?,
-                    };
-                    (k.seq, k.key.clone(), value)
-                };
+                let (seq, key) = (st.keys[kid].seq, st.keys[kid].key.clone());
+                let value = inflate::inflate_value(&mut st, kid).await?;
                 return Ok(Some(Entry {
                     seq,
                     key,
@@ -345,6 +363,7 @@ impl Bee {
                 .get(index)
                 .ok_or(Error::Message("child index out of range"))?;
         }
+        Err(Error::Message("tree too deep"))
     }
 
     /// JS `createReadStream`.
@@ -390,6 +409,7 @@ impl Bee {
             shared: self.inner.shared.clone(),
             context: context.clone(),
             state: self.inner.state.clone(),
+            writer: self.inner.writer.clone(),
             root: StdMutex::new(RootState {
                 loaded: true,
                 ptr: None,
@@ -400,6 +420,7 @@ impl Bee {
             }),
             writable: false,
             view: true,
+            read_options: StdMutex::new(self.read_options()),
         });
         Ok(Bee { inner })
     }
@@ -413,6 +434,7 @@ impl Bee {
     /// Move this view to a head, retaining its write permission.
     pub async fn move_to(&self, head: Head) -> Result<()> {
         let context = self.context_by_key(head.key).await?;
+        let _writer = self.inner.writer.lock().await;
         let _state = self.inner.state.lock().await;
         let mut root = lock(&self.inner.root);
         root.loaded = true;
@@ -455,7 +477,9 @@ impl Bee {
     /// List keys in the current context's core table.
     pub async fn cores(&self, local: bool) -> Result<Vec<[u8; 32]>> {
         let context = self.context();
-        context.update(false).await?;
+        READ_OPTIONS
+            .scope(self.read_options(), context.update(true))
+            .await?;
         let mut keys = context.core_keys()?;
         if !local {
             keys.retain(|key| key != &context.local);
@@ -466,8 +490,11 @@ impl Bee {
     /// Move to the root core's latest length.
     pub async fn update(&self) -> Result<bool> {
         let context = self.context();
+        let _writer = self.inner.writer.lock().await;
+        context.reset_if_forked();
         let length = context.core.length();
         let mut st = self.inner.state.lock().await;
+        st.check_fork(&context.core);
         let ptr = if length == 0 {
             None
         } else {
@@ -655,6 +682,495 @@ mod tests {
         assert_eq!(target_core.session_count(), 1);
         drop(bee);
         assert_eq!(target_core.session_count(), 0);
+        store.close().await;
+    }
+
+    fn self_referencing_root() -> Block {
+        let own = Some(Loc::default());
+        let insert = |index| EncDelta {
+            kind: encoding::OP_INSERT,
+            index,
+            ptr: own,
+        };
+        Block {
+            type_: encoding::TYPE_LATEST,
+            tree: vec![RawTree {
+                keys: vec![insert(0)],
+                // Both children name this node's own (seq 0, offset 0).
+                children: vec![insert(0), insert(1)],
+            }],
+            keys: vec![KeyData {
+                key: Bytes::from_static(b"m"),
+                value: Some(Bytes::from_static(b"v")),
+                value_ptr: None,
+            }],
+            t: encoding::T,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn child_pointer_cycle_errors_and_releases_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Corestore::open(dir.path()).unwrap();
+        let bee = Bee::open(&store, None).await.unwrap();
+        let block = encoding::encode_block(self_referencing_root());
+        bee.inner.context.core.append(&[block]).await.unwrap();
+        bee.update().await.unwrap();
+
+        let get = tokio::spawn({
+            let bee = bee.clone();
+            async move { bee.get(b"a").await }
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), get)
+            .await
+            .expect("cycle must not spin")
+            .unwrap();
+        assert!(matches!(result, Err(Error::Message("tree too deep"))));
+
+        let mut batch = bee.batch();
+        batch.put(&b"a"[..], &b"x"[..]);
+        assert!(batch.flush().await.is_err());
+
+        let other = bee.snapshot().await.unwrap();
+        let entry = other.get(b"m").await.unwrap().unwrap();
+        assert_eq!(entry.value, &b"v"[..]);
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn update_after_truncate_reads_the_new_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Corestore::open(dir.path()).unwrap();
+        let writer = Bee::open(&store, None).await.unwrap();
+        let mut batch = writer.batch();
+        batch.put(&b"a"[..], &b"old"[..]);
+        batch.flush().await.unwrap();
+
+        let reader = Bee::open(&store, Some(writer.key())).await.unwrap();
+        assert_eq!(reader.get(b"a").await.unwrap().unwrap().value, "old");
+
+        writer.inner.context.core.truncate(0, None).await.unwrap();
+        let rewriter = Bee::open(&store, Some(writer.key())).await.unwrap();
+        let mut batch = rewriter.batch();
+        batch.put(&b"a"[..], &b"new"[..]);
+        batch.flush().await.unwrap();
+        assert_eq!(rewriter.length(), 1);
+
+        reader.update().await.unwrap();
+        assert_eq!(reader.get(b"a").await.unwrap().unwrap().value, "new");
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn empty_flush_after_move_to_genesis_appends_a_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Corestore::open(dir.path()).unwrap();
+        let bee = Bee::open(&store, None).await.unwrap();
+        let mut batch = bee.batch();
+        for key in ["a", "b", "c"] {
+            batch.put(key, "value");
+        }
+        batch.flush().await.unwrap();
+        let length = bee.length();
+
+        bee.move_to(Head {
+            key: bee.key(),
+            length: 0,
+        })
+        .await
+        .unwrap();
+        bee.batch().flush().await.unwrap();
+        assert_eq!(bee.length(), length + 1);
+        assert_eq!(
+            bee.head(),
+            Some(Head {
+                key: bee.key(),
+                length: length + 1,
+            })
+        );
+        let reopened = Bee::open(&store, Some(bee.key())).await.unwrap();
+        assert!(reopened.get(b"a").await.unwrap().is_none());
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn reindex_of_type_0_source_returns_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Corestore::open(dir.path()).unwrap();
+        // `fixtures/block-0.json`: one legacy type 0 block.
+        let block = Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x00, 0x0e, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x02, 0x05, 0x61, 0x6c, 0x70, 0x68, 0x61, 0x01, 0x31, 0x04, 0x62, 0x65, 0x74, 0x61,
+            0x01, 0x32, 0x00,
+        ]);
+        let source = store.get(StoreGetOptions::name("source")).await.unwrap();
+        source.append(&[block]).await.unwrap();
+        let bee = Bee::open(&store, None).await.unwrap();
+        bee.move_to(Head {
+            key: *source.key(),
+            length: 1,
+        })
+        .await
+        .unwrap();
+        assert_eq!(bee.get(b"alpha").await.unwrap().unwrap().value, "1");
+        assert!(bee.reindex(|_| false, 0, None).await.is_err());
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn default_read_options_time_out_missing_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Corestore::open(dir.path()).unwrap();
+        let writer = Bee::open(&store, None).await.unwrap();
+        let mut batch = writer.batch();
+        batch.put(&b"key"[..], &b"value"[..]);
+        batch.flush().await.unwrap();
+        let core = &writer.inner.context.core;
+        core.clear(0, core.length()).await.unwrap();
+
+        let reader = Bee::open(&store, Some(writer.key())).await.unwrap();
+        reader.set_default_read_options(ReadOptions {
+            timeout: Some(std::time::Duration::from_millis(50)),
+            ..Default::default()
+        });
+        let snapshot = reader.snapshot().await.unwrap();
+        for bee in [&reader, &snapshot] {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), bee.get(b"key"))
+                .await
+                .expect("the default timeout applies");
+            assert!(matches!(
+                result,
+                Err(Error::Core(hypercore::CoreError::Timeout))
+            ));
+        }
+        store.close().await;
+    }
+
+    fn item(i: usize) -> Bytes {
+        Bytes::from(format!("key/{i:05}"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_block_does_not_stall_cached_reads_or_writes() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Corestore::open(dir.path()).unwrap();
+        let writer = Bee::open(&store, None).await.unwrap();
+        let mut batch = writer.batch();
+        for i in 0..1000 {
+            batch.put(item(i), &b"v"[..]);
+        }
+        batch.flush().await.unwrap();
+        let root_seq = writer.length() - 1;
+        let seq_of = async |i| writer.get(&item(i)).await.unwrap().unwrap().seq;
+        let cached = item(0);
+        let cached_seq = seq_of(0).await;
+        let mut missing = None;
+        for i in 1..1000 {
+            let seq = seq_of(i).await;
+            if seq != cached_seq && seq != root_seq {
+                missing = Some((item(i), seq));
+                break;
+            }
+        }
+        let (missing, missing_seq) = missing.expect("a leaf outside the root and cached blocks");
+        assert_ne!(cached_seq, root_seq);
+
+        let bee = Bee::open(&store, Some(writer.key())).await.unwrap();
+        assert!(bee.writable());
+        bee.get(&cached).await.unwrap().unwrap();
+        let core = &bee.inner.context.core;
+        core.clear(missing_seq, missing_seq + 1).await.unwrap();
+
+        let stuck_get = tokio::spawn({
+            let bee = bee.clone();
+            let missing = missing.clone();
+            async move { bee.get(&missing).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!stuck_get.is_finished(), "no peer has the cleared block");
+
+        let wait = Duration::from_secs(5);
+        let entry = tokio::time::timeout(wait, bee.get(&cached))
+            .await
+            .expect("a cached read does not wait for another read's block")
+            .unwrap();
+        assert_eq!(entry.unwrap().value, "v");
+        let added = Bytes::from(format!("{}x", String::from_utf8_lossy(&cached)));
+        let mut batch = bee.batch();
+        batch.put(added.clone(), &b"w"[..]);
+        tokio::time::timeout(wait, batch.flush())
+            .await
+            .expect("a flush on cached nodes does not wait for a read's block")
+            .unwrap();
+
+        let stuck_flush = tokio::spawn({
+            let bee = bee.clone();
+            async move {
+                let mut batch = bee.batch();
+                batch.put(missing, &b"w"[..]);
+                batch.flush().await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!stuck_flush.is_finished(), "no peer has the cleared block");
+        for key in [&cached, &added] {
+            tokio::time::timeout(wait, bee.get(key))
+                .await
+                .expect("a cached read does not wait for a flush's block")
+                .unwrap()
+                .unwrap();
+        }
+
+        stuck_get.abort();
+        stuck_flush.abort();
+        tokio::time::timeout(wait, store.close())
+            .await
+            .expect("store closes");
+    }
+
+    /// A read that got its bytes before a truncate and rewrite must not install
+    /// them under the pointer of the new fork's block at the same location.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fork_during_a_fetch_installs_the_new_fork() {
+        use context::{FETCH_GATE, FetchGate};
+        let wait = std::time::Duration::from_secs(5);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Corestore::open(dir.path()).unwrap();
+        let writer = Bee::open(&store, None).await.unwrap();
+        let mut batch = writer.batch();
+        batch.put(&b"a"[..], &b"old"[..]);
+        batch.flush().await.unwrap();
+
+        let reader = Bee::open(&store, Some(writer.key())).await.unwrap();
+        let gate = Arc::new(FetchGate::default());
+        gate.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let paused = tokio::spawn(FETCH_GATE.scope(gate.clone(), {
+            let reader = reader.clone();
+            async move { reader.get(b"a").await }
+        }));
+        tokio::time::timeout(wait, gate.reached.notified())
+            .await
+            .expect("the read got the old root block");
+
+        writer.inner.context.core.truncate(0, None).await.unwrap();
+        let rewriter = Bee::open(&store, Some(writer.key())).await.unwrap();
+        let mut batch = rewriter.batch();
+        batch.put(&b"a"[..], &b"new"[..]);
+        batch.flush().await.unwrap();
+        assert_eq!(rewriter.length(), 1, "same (core, seq, offset) as before");
+        // The new root gets its own pointer; the paused read's pointer is freed.
+        reader.update().await.unwrap();
+        reader.inner.state.lock().await.sweep();
+
+        gate.release.notify_one();
+        let entry = tokio::time::timeout(wait, paused)
+            .await
+            .expect("the paused read ends")
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.value, "new");
+        assert_eq!(reader.get(b"a").await.unwrap().unwrap().value, "new");
+        store.close().await;
+    }
+
+    type Model = std::collections::BTreeMap<Bytes, Bytes>;
+
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *seed >> 33
+    }
+
+    fn model_range(model: &Model, o: &RangeOptions) -> Vec<(Bytes, Bytes)> {
+        let mut out: Vec<_> = model
+            .iter()
+            .filter(|(k, _)| {
+                o.gt.as_ref().is_none_or(|b| *k > b)
+                    && o.gte.as_ref().is_none_or(|b| *k >= b)
+                    && o.lt.as_ref().is_none_or(|b| *k < b)
+                    && o.lte.as_ref().is_none_or(|b| *k <= b)
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if o.reverse {
+            out.reverse();
+        }
+        if let Some(limit) = o.limit {
+            out.truncate(limit);
+        }
+        out
+    }
+
+    /// Model versions: version `i` is published before its flush starts and
+    /// gets its head when the flush returns.
+    type Versions = Arc<StdMutex<Vec<(Option<Head>, Arc<Model>)>>>;
+
+    async fn check_reads(
+        bee: Bee,
+        versions: Versions,
+        done: Arc<std::sync::atomic::AtomicBool>,
+        mut seed: u64,
+    ) -> usize {
+        const KEYS: u64 = 5000;
+        let mut ops = 0;
+        while ops < 60 || !done.load(std::sync::atomic::Ordering::Acquire) {
+            ops += 1;
+            // Snapshot at a finished version, or the live bee with every
+            // version it can be at during the call.
+            let snapshot = lcg(&mut seed).is_multiple_of(2);
+            let (target, before) = if snapshot {
+                let (head, model) = {
+                    let list = lock(&versions);
+                    let finished: Vec<_> = list.iter().filter(|(h, _)| h.is_some()).collect();
+                    let (head, model) = finished[lcg(&mut seed) as usize % finished.len()];
+                    (head.unwrap(), model.clone())
+                };
+                (bee.checkout(head).await.unwrap(), Some(model))
+            } else {
+                (bee.clone(), None)
+            };
+            let low = lock(&versions).len().saturating_sub(2);
+            let models = |before: &Option<Arc<Model>>| -> Vec<Arc<Model>> {
+                match before {
+                    Some(model) => vec![model.clone()],
+                    None => lock(&versions)[low..]
+                        .iter()
+                        .map(|(_, m)| m.clone())
+                        .collect(),
+                }
+            };
+            if lcg(&mut seed).is_multiple_of(3) {
+                let key = Bytes::from(format!("k{:05}", lcg(&mut seed) % KEYS));
+                let got = target.get(&key).await.unwrap().map(|e| e.value);
+                let ok = models(&before).iter().any(|m| m.get(&key) == got.as_ref());
+                assert!(ok, "get {key:?} = {got:?} matches no model version");
+            } else {
+                let a = Bytes::from(format!("k{:05}", lcg(&mut seed) % KEYS));
+                let b = Bytes::from(format!("k{:05}", lcg(&mut seed) % KEYS));
+                let (a, b) = if a <= b { (a, b) } else { (b, a) };
+                let mut o = RangeOptions {
+                    reverse: lcg(&mut seed).is_multiple_of(2),
+                    limit: lcg(&mut seed).is_multiple_of(3).then_some(150),
+                    ..Default::default()
+                };
+                match lcg(&mut seed) % 3 {
+                    0 => (o.gte, o.lt) = (Some(a), Some(b)),
+                    1 => (o.gt, o.lte) = (Some(a), Some(b)),
+                    _ => o.gte = Some(a),
+                }
+                let mut stream = target.range(o.clone());
+                let mut got = Vec::new();
+                while let Some(e) = stream.next().await.unwrap() {
+                    got.push((e.key, e.value));
+                    tokio::task::yield_now().await;
+                }
+                let ok = models(&before).iter().any(|m| model_range(m, &o) == got);
+                assert!(
+                    ok,
+                    "range {o:?} ({} entries) matches no model version",
+                    got.len()
+                );
+            }
+        }
+        ops
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_readers_and_writer_match_the_model() {
+        const KEYS: u64 = 5000;
+        let value = |tag: String, seed: u64| {
+            let pad = if seed.is_multiple_of(7) {
+                1100
+            } else {
+                seed as usize % 40
+            };
+            Bytes::from(format!("{tag}{}", "x".repeat(pad)))
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = Corestore::open(dir.path()).unwrap();
+        let writer = Bee::open(&store, None).await.unwrap();
+        let mut seed = 42u64;
+        let mut model = Model::new();
+        let mut batch = writer.batch();
+        for i in 0..4000u64 {
+            let (k, v) = (
+                Bytes::from(format!("k{:05}", i)),
+                value(format!("v0-{i}"), lcg(&mut seed)),
+            );
+            model.insert(k.clone(), v.clone());
+            batch.put(k, v);
+        }
+        batch.flush().await.unwrap();
+
+        // A cold bee with a tiny cache, so every task evicts and sweeps.
+        let bee = Bee::open(&store, Some(writer.key())).await.unwrap();
+        drop(writer);
+        // Two nodes: even a batch's root path is evicted by readers while the
+        // batch waits for a block, unless it is retained.
+        bee.inner.state.lock().await.max_nodes = 2;
+        let versions: Versions = Arc::new(StdMutex::new(vec![(bee.head(), Arc::new(model))]));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let readers: Vec<_> = (0..4u64)
+            .map(|i| {
+                tokio::spawn(check_reads(
+                    bee.clone(),
+                    versions.clone(),
+                    done.clone(),
+                    1000 + i,
+                ))
+            })
+            .collect();
+        let write = tokio::spawn({
+            let (bee, versions, done) = (bee.clone(), versions.clone(), done.clone());
+            async move {
+                for round in 1..=25u64 {
+                    let mut next = (*lock(&versions).last().unwrap().1).clone();
+                    let mut batch = bee.batch();
+                    for i in 0..150 {
+                        let r = lcg(&mut seed);
+                        let key = Bytes::from(format!("k{:05}", r % KEYS));
+                        if r.is_multiple_of(3) {
+                            next.remove(&key);
+                            batch.del(key);
+                        } else {
+                            let v = value(format!("v{round}-{i}"), lcg(&mut seed));
+                            next.insert(key.clone(), v.clone());
+                            batch.put(key, v);
+                        }
+                    }
+                    lock(&versions).push((None, Arc::new(next)));
+                    batch.flush().await.unwrap();
+                    lock(&versions).last_mut().unwrap().0 = bee.head();
+                    tokio::task::yield_now().await;
+                }
+                done.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
+
+        let all = async {
+            write.await.unwrap();
+            let mut ops = 0;
+            for reader in readers {
+                ops += reader.await.unwrap();
+            }
+            ops
+        };
+        let ops = tokio::time::timeout(std::time::Duration::from_secs(300), all)
+            .await
+            .expect("stress test finishes");
+        let st = bee.inner.state.lock().await;
+        eprintln!(
+            "STRESS reads={ops} nodes={} ptrs={} keys={}",
+            st.nodes.len(),
+            st.ptrs.len(),
+            st.keys.len()
+        );
+        drop(st);
         store.close().await;
     }
 }

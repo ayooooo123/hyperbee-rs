@@ -26,6 +26,20 @@ fn read_options() -> GetOptions {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Pauses the task's first block read after the bytes arrived.
+    pub(crate) static FETCH_GATE: Arc<FetchGate>;
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct FetchGate {
+    pub armed: std::sync::atomic::AtomicBool,
+    pub reached: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
 #[derive(Default)]
 pub(crate) struct Mappings {
     known: HashMap<[u8; 32], [u8; 32]>,
@@ -86,6 +100,8 @@ pub(crate) struct CtxState {
     pub opened: Vec<Option<Arc<Session>>>,
     pub cores: Vec<CoreInfo>,
     pub changed: bool,
+    /// Core fork the fields above were read from.
+    pub fork: u64,
 }
 
 pub(crate) struct Context {
@@ -97,6 +113,7 @@ pub(crate) struct Context {
 
 impl Context {
     pub fn new(shared: Arc<Shared>, core: Arc<Session>, local: [u8; 32]) -> Arc<Self> {
+        let fork = core.fork();
         Arc::new(Self {
             shared,
             core,
@@ -108,8 +125,27 @@ impl Context {
                 opened: Vec::new(),
                 cores: Vec::new(),
                 changed: false,
+                fork,
             }),
         })
+    }
+
+    /// Drop the checkpoint and core table read from an older fork, so the next
+    /// update reads them again from the current blocks.
+    pub fn reset_if_forked(&self) {
+        let fork = self.core.fork();
+        let mut s = lock(&self.state);
+        if s.fork != fork {
+            *s = CtxState {
+                length: 0,
+                checkpoint: 0,
+                invalidation: 0,
+                opened: Vec::new(),
+                cores: Vec::new(),
+                changed: false,
+                fork,
+            };
+        }
     }
 
     pub fn length(&self) -> u64 {
@@ -193,6 +229,7 @@ impl Context {
     }
 
     pub async fn update(&self, persist: bool) -> crate::Result<()> {
+        self.reset_if_forked();
         let core_length = self.core.length();
         if self.length() >= core_length {
             return Ok(());
@@ -276,6 +313,7 @@ impl Context {
     }
 
     pub async fn update_maybe(&self, core: u64, origin: Option<&Block>) -> crate::Result<()> {
+        self.reset_if_forked();
         let origin_invalidation = origin.map_or(0, |b| b.invalidation);
         if !self.needs_update(core, origin_invalidation) {
             return Ok(());
@@ -327,14 +365,26 @@ impl Context {
         core: u64,
         origin: Option<&Block>,
     ) -> crate::Result<Bytes> {
+        // Tests interleave tasks inside every block read, where the tree lock
+        // is released.
+        #[cfg(test)]
+        tokio::task::yield_now().await;
         if core > lock(&self.state).cores.len() as u64 {
             self.update_maybe(core, origin).await?;
         }
         let session = self.core(core).await?;
-        session
+        let buffer = session
             .get(seq, read_options())
             .await?
-            .ok_or(Error::BlockNotAvailable)
+            .ok_or(Error::BlockNotAvailable)?;
+        #[cfg(test)]
+        if let Ok(gate) = FETCH_GATE.try_with(Arc::clone)
+            && gate.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+        Ok(buffer)
     }
 
     pub async fn get_loaded_context(self: &Arc<Self>, core: u64) -> crate::Result<Arc<Context>> {

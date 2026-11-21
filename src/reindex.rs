@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::context::Context;
-use crate::encoding::{Block, Loc, Metadata, TYPE_COMPAT, encode_block};
+use crate::encoding::{Block, Loc, Metadata, TYPE_LATEST, encode_block};
 use crate::{Bee, Change, Error, Head, Result};
 /// Optional value transform used when copying changes.
 pub type ValueMap<'a> = dyn FnMut(&[u8], &[u8], &Change) -> Option<Bytes> + 'a;
@@ -51,7 +51,9 @@ impl Bee {
             }
             changes.push(change);
         }
-        self.copy_changes(changes, map).await
+        crate::READ_OPTIONS
+            .scope(self.read_options(), self.copy_changes(changes, map))
+            .await
     }
 
     /// Reindex with an asynchronous, fallible head predicate.
@@ -76,7 +78,9 @@ impl Bee {
             }
             changes.push(change);
         }
-        self.copy_changes(changes, map).await
+        crate::READ_OPTIONS
+            .scope(self.read_options(), self.copy_changes(changes, map))
+            .await
     }
 
     async fn copy_changes(
@@ -87,7 +91,17 @@ impl Bee {
         if changes.is_empty() {
             return Ok(0);
         }
-        let state = self.inner.state.lock().await;
+        // Only the latest block type has an encoder; JS also rewrites type 0
+        // and compat blocks.
+        if changes
+            .iter()
+            .flat_map(|change| &change.batch)
+            .any(|block| block.type_ != TYPE_LATEST)
+        {
+            return Err(Error::Message("cannot reindex type 0 or compat blocks"));
+        }
+        // Orders the append with batch flushes; the tree itself is not read.
+        let writer = self.inner.writer.lock().await;
         let local = self.context_by_key(self.inner.context.local).await?;
         local.update(true).await?;
         let base = local.core.length();
@@ -103,7 +117,7 @@ impl Bee {
                 .checked_sub(change.batch.len() as u64)
                 .ok_or(Error::Message("invalid batch length"))?;
             for j in 0..change.batch.len() {
-                copied.insert((change.head.key, first + j as u64), start + j as u64);
+                copied.insert((*src.core.key(), first + j as u64), start + j as u64);
             }
             if let Some(map) = map.as_mut() {
                 for j in 0..change.batch.len() {
@@ -138,9 +152,6 @@ impl Bee {
                 }
             }
             for mut block in change.batch {
-                if block.type_ == TYPE_COMPAT {
-                    return Err(Error::Message("cannot index compat blocks"));
-                }
                 let origin = block.clone();
                 for tree in &mut block.tree {
                     for delta in tree.keys.iter_mut().chain(tree.children.iter_mut()) {
@@ -179,7 +190,10 @@ impl Bee {
                 if let Some(tail) = change.tail {
                     Some(Loc {
                         core: local.get_core_offset_by_key(tail.key).await?,
-                        seq: tail.length - 1,
+                        seq: tail
+                            .length
+                            .checked_sub(1)
+                            .ok_or(Error::Message("invalid change tail"))?,
                         offset: 0,
                     })
                 } else {
@@ -208,7 +222,7 @@ impl Bee {
             buffers.push(encode_block(block));
         }
         local.core.append(&buffers).await?;
-        drop(state);
+        drop(writer);
         self.move_to(Head {
             key: *local.core.key(),
             length: local.core.length(),

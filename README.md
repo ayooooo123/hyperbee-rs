@@ -55,6 +55,10 @@ while let Some(entry) = stream.next().await? {
   core; `reindex_async` accepts a fallible asynchronous head predicate.
 - `get_with_options`, `range_with_options` and `changes_with_options` accept
   Hypercore read options, including timeouts, wait and request bags.
+- `Bee::set_default_read_options(ReadOptions)` sets the options used when a
+  call gives none (`get`, `range`, `changes`, batch flushes, `cores`,
+  `reindex`). `checkout` and `snapshot` handles start with the options of the
+  handle they come from.
 - `Bee::close()` closes an owning bee's store; closing a view leaves it open.
 - `Bee::update() -> Result<bool>`: move to the root core's latest block.
 
@@ -76,9 +80,16 @@ same `Corestore`, as in the JS implementation.
 - Values larger than 1024 bytes are stored in separate value blocks exactly as
   hyperbee2 does; value pointers, offsets and block splitting follow the JS
   rules.
-- The in-memory tree uses append-only arenas; the JS node cache's LRU eviction
-  and its tuning knobs are not ported (nodes stay resident for the lifetime of
-  the `Bee`).
+- Memory: the node cache of `lib/cache.js` is ported with its default size,
+  4096 inflated nodes. Above it the least recently used unchanged nodes are
+  dropped and inflated again from their blocks on the next use; a sweep then
+  frees the pointers and keys no live node references, so the tree's memory
+  stays bounded for the lifetime of a `Bee`. Nodes, pointers and keys live in
+  generational arenas: an id kept past its slot is detected, never read as
+  another value. Roots, open range streams and readers waiting for a block
+  keep the location of their pointer and re-create it if it was freed, so
+  snapshots and open ranges keep working. A batch retains every node it
+  touches until it flushes, as JS `retainAndInflate` does.
 - Encryption keys are currently attached to the physical core on first open;
   reopening a cached core with a different key cannot change its encryption.
 
@@ -86,9 +97,49 @@ same `Corestore`, as in the JS implementation.
 
 - Diff streams (`createDiffStream`), `copy`, preload hooks, tracing and custom
   encryption providers beyond the encryption keys supported by hypercore.
-- Node cache eviction/tuning, range prefetching, rollback (`unbatch`).
+- Node cache tuning (`maxCacheSize`), range prefetching, rollback (`unbatch`).
 - Mappings can be read from block metadata, but there is no write API that
   supplies new mappings.
+
+## Deviations from npm
+
+These bound hostile input or differ from the npm defaults. Reference version:
+hyperbee2 2.21.4. hyperbee2 2.22.0 only adds local downloaded-subtree markers
+(schema version 3, local storage only); blocks and pointers are unchanged, and
+nothing of it is ported.
+
+- Tree descents (get, range, put, delete) stop at depth 64 with
+  `Error::Message("tree too deep")`. npm has no bound, so a child pointer
+  cycle spins forever there.
+- Block type 1 with a tree degree `t` above 4096 is rejected at decode
+  (`"tree degree too large"`). npm accepts any `t`.
+- The node cache and the per-core checkpoint state are dropped when a core's
+  fork changes (truncate and re-append), so `update()` and later reads see the
+  new blocks. npm keeps serving cached nodes of the old fork.
+- `reindex` returns an error for type 0 and bee1 compat source blocks, because
+  only the latest block type has an encoder. npm rewrites them in their own
+  type.
+- `Entry.value` is `Bytes`, not an option: a key written without a value
+  (JS `value: null`) reads as empty bytes.
+- Metadata mappings are always applied. A default npm reader
+  (`mappings: false`) ignores them, so both can resolve one block to
+  different cores.
+- Same-core pointers that name a later seq are accepted, as in npm: a valid
+  npm batch can point from a lower block to a key in a higher block of the
+  same batch. A hostile pointer past the core length waits for peers; give
+  reads a timeout (`set_default_read_options`).
+- When the cache is over its size and its oldest node is retained by a batch
+  in progress, that node is moved to the newest end and eviction goes on.
+  npm stops evicting until the batch flushes.
+- Callers that need the same missing node each read its blocks (hypercore
+  shares the network request) and the first one installs the node; npm also
+  shares the decoded blocks between them.
+- Batches, `reindex`, `move_to` and `update` take one writer lock per tree
+  (shared with its checkouts and snapshots); npm locks only batches and
+  reindex. Readers never take it.
+- Two `Bee` instances on one writable core are not safe to flush
+  concurrently: a flush reads the core length and appends later, so their
+  blocks can interleave. npm has the same race.
 
 ## Fixtures and tests
 
@@ -121,8 +172,28 @@ cargo test -- --include-ignored
 
 Cold tree inflation shares decoded blocks within one node, then drops that
 temporary cache. It never caches decoded blocks across forks or later reads.
-Apply and lazy tree inflation still share the ordered tree-state lock; snapshots
-share that arena too, so replacing it with a read lock would not make reads safe.
+The tree lock is held only while nodes are looked up or installed: every
+block read (node inflation, values, a batch's descent) runs with it released,
+under the caller's read options, and the node is installed afterwards unless
+another caller did it first. A `get` waiting for a block no peer has does not
+stall reads of cached nodes, other gets, range streams or batches on cached
+nodes (`missing_block_does_not_stall_cached_reads_or_writes`). A batch releases
+the lock only while its descents wait for blocks; it holds it while it builds
+and appends its blocks.
+`node_cache_bounds_the_arenas_and_open_ranges_survive` reads 20,000 keys with
+an 8-node cache and checks the live nodes, pointers and keys stay bounded while
+a range opened before the reads still returns its keys;
+`evicted_nodes_write_the_same_blocks` checks that writes over evicted nodes
+produce the same blocks as writes with every node resident.
+A read notes the fork of the node's core before it reads the block. If the
+core forked (truncate and rewrite) before the node is installed, the bytes
+may be of the old fork and the node is read again
+(`fork_during_a_fetch_installs_the_new_fork`). npm has no such check: its
+node cache is keyed by core, seq and offset and is never cleared on a fork.
+`concurrent_readers_and_writer_match_the_model` runs four reader tasks (gets
+and bounded forward and reverse ranges, on the live bee and on snapshots)
+against a writer of puts and deletes, with a two-node cache and a yield in
+every block read, and checks every result against a model of each version.
 
 Cross-core context lookup stores weak references: live contexts retain their
 identity, expired contexts reload by key, and dropping the last tree releases

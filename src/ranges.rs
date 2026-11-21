@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use bytes::Bytes;
 
 use crate::inflate::{inflate, inflate_value};
-use crate::tree::{KeyId, PtrId, TreeState};
+use crate::tree::{KeyId, Locked, MAX_DEPTH, NodeId, PtrRef};
 use crate::{Bee, Entry, Error, Result};
 
 /// Bounds for [`Bee::range`]. Both edges are inclusive or exclusive exactly as
@@ -21,9 +21,20 @@ pub struct RangeOptions {
     pub limit: Option<usize>,
 }
 
+/// A frame keeps its node's location, because the tree lock is released
+/// between `next` calls and the node cache may free the pointer meanwhile.
 struct Frame {
-    node: PtrId,
+    node: PtrRef,
     offset: usize,
+}
+
+async fn inflate_frame(st: &mut Locked, node: &mut PtrRef) -> Result<NodeId> {
+    let mut ptr = st.resolve(node)?;
+    let id = inflate(st, &mut ptr).await?;
+    if ptr != node.id {
+        *node = st.ptr_ref(ptr);
+    }
+    Ok(id)
 }
 
 pub struct RangeStream {
@@ -58,6 +69,7 @@ impl RangeStream {
             -1
         };
         Self {
+            read_options: bee.read_options(),
             bee,
             stack: Vec::new(),
             reverse: opts.reverse,
@@ -67,7 +79,6 @@ impl RangeStream {
             inclusive,
             compare,
             opened: false,
-            read_options: crate::ReadOptions::default(),
         }
     }
     pub(crate) fn with_read_options(mut self, options: crate::ReadOptions) -> Self {
@@ -82,7 +93,7 @@ impl RangeStream {
 
     async fn next_inner(&mut self) -> Result<Option<Entry>> {
         let inner = self.bee.inner.clone();
-        let mut st = inner.state.lock().await;
+        let mut st = Locked::new(inner.state.clone()).await;
         if !self.opened {
             self.open(&mut st).await?;
             self.opened = true;
@@ -91,12 +102,8 @@ impl RangeStream {
             return Ok(None);
         };
         let (seq, key, value) = {
-            let k = &st.keys[key];
-            let value = match &k.value {
-                Some(v) => Some(v.clone()),
-                None => inflate_value(&st, key).await?,
-            };
-            (k.seq, k.key.clone(), value)
+            let (seq, k) = (st.keys[key].seq, st.keys[key].key.clone());
+            (seq, k, inflate_value(&mut st, key).await?)
         };
         Ok(Some(Entry {
             seq,
@@ -105,15 +112,15 @@ impl RangeStream {
         }))
     }
 
-    async fn open(&mut self, st: &mut TreeState) -> Result<()> {
+    async fn open(&mut self, st: &mut Locked) -> Result<()> {
         if self.limit == Some(0) {
             return Ok(());
         }
-        let Some(root) = self.bee.root_ptr(st).await? else {
+        let Some(root) = self.bee.root_ptr(st)? else {
             return Ok(());
         };
         self.stack.push(Frame {
-            node: root,
+            node: st.ptr_ref(root),
             offset: 0,
         });
         if if self.reverse {
@@ -127,7 +134,7 @@ impl RangeStream {
         let adjust = if self.inclusive { 0 } else { 1 };
         loop {
             let top = self.stack.len() - 1;
-            let node = inflate(st, self.stack[top].node).await?;
+            let node = inflate_frame(st, &mut self.stack[top].node).await?;
             let (child_len, offset) = {
                 let n = &st.nodes[node];
                 let key_len = n.keys.length();
@@ -159,8 +166,11 @@ impl RangeStream {
                 .children
                 .get(j)
                 .ok_or(Error::Message("child index out of range"))?;
+            if self.stack.len() >= MAX_DEPTH {
+                return Err(Error::Message("tree too deep"));
+            }
             self.stack.push(Frame {
-                node: next,
+                node: st.ptr_ref(next),
                 offset: 0,
             });
             self.stack[top].offset = offset + 1;
@@ -168,10 +178,10 @@ impl RangeStream {
         Ok(())
     }
 
-    async fn next_key(&mut self, st: &mut TreeState) -> Result<Option<KeyId>> {
+    async fn next_key(&mut self, st: &mut Locked) -> Result<Option<KeyId>> {
         while !self.stack.is_empty() && self.limit != Some(0) {
             let mut top = self.stack.pop().expect("non-empty");
-            let node = inflate(st, top.node).await?;
+            let node = inflate_frame(st, &mut top.node).await?;
             let offset = top.offset;
             top.offset += 1;
             let child = offset & 1 == 0;
@@ -186,8 +196,11 @@ impl RangeStream {
                         .children
                         .get(j)
                         .ok_or(Error::Message("child index out of range"))?;
+                    if self.stack.len() >= MAX_DEPTH {
+                        return Err(Error::Message("tree too deep"));
+                    }
                     self.stack.push(Frame {
-                        node: next,
+                        node: st.ptr_ref(next),
                         offset: 0,
                     });
                 }
@@ -236,5 +249,74 @@ fn cmp_end(key: &Bytes, end: Option<&Bytes>) -> Ordering {
     match end {
         Some(e) => key.as_ref().cmp(e.as_ref()),
         None => Ordering::Less,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn node_cache_bounds_the_arenas_and_open_ranges_survive() {
+        const KEYS: usize = 20_000;
+        const MAX: usize = 8;
+        let item = |i: usize| Bytes::from(format!("key/{i:05}"));
+        let dir = tempfile::tempdir().unwrap();
+        let store = corestore::Corestore::open(dir.path()).unwrap();
+        let writer = Bee::open(&store, None).await.unwrap();
+        // Two batches: the range below walks the first root, the reads walk
+        // the second, so the first root's node and pointer get freed.
+        let half = KEYS / 2;
+        let mut heads = Vec::new();
+        for part in [0..half, half..KEYS] {
+            let mut batch = writer.batch();
+            for i in part {
+                batch.put(item(i), &b"v"[..]);
+            }
+            batch.flush().await.unwrap();
+            heads.push(writer.head().unwrap());
+        }
+        let first_head = heads[0];
+
+        let reader = Bee::open(&store, Some(writer.key())).await.unwrap();
+        reader.inner.state.lock().await.max_nodes = MAX;
+        let old = reader.checkout(first_head).await.unwrap();
+        let mut range = old.range(RangeOptions::default());
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            seen.push(range.next().await.unwrap().unwrap().key);
+        }
+        let frames: Vec<_> = range.stack.iter().map(|f| f.node.id).collect();
+
+        let (mut nodes, mut ptrs, mut keys) = (0, 0, 0);
+        for i in 0..KEYS {
+            let entry = reader.get(&item(i)).await.unwrap().unwrap();
+            assert_eq!(entry.key, item(i));
+            let st = reader.inner.state.lock().await;
+            nodes = nodes.max(st.nodes.len());
+            ptrs = ptrs.max(st.ptrs.len());
+            keys = keys.max(st.keys.len());
+        }
+        eprintln!("PEAK nodes={nodes} ptrs={ptrs} keys={keys}");
+        // The cache, plus the node being installed.
+        assert!(nodes <= MAX + 1, "{nodes} live nodes");
+        // Live nodes hold at most 2T pointers and 2T - 1 keys each; up to MAX
+        // dropped nodes wait for the next sweep.
+        let per_node = 2 * crate::encoding::T as usize;
+        assert!(ptrs <= (2 * MAX + 1) * per_node + 8, "{ptrs} live pointers");
+        assert!(keys <= (2 * MAX + 1) * per_node, "{keys} live keys");
+
+        {
+            let st = reader.inner.state.lock().await;
+            assert!(
+                frames.iter().any(|id| !st.has_ptr(*id)),
+                "the open range's pointers were freed"
+            );
+        }
+        while let Some(entry) = range.next().await.unwrap() {
+            seen.push(entry.key);
+        }
+        assert_eq!(seen, (0..half).map(item).collect::<Vec<_>>());
+        store.close().await;
     }
 }
