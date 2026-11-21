@@ -253,7 +253,9 @@ impl<T> Delta<T> {
 pub(crate) struct CompressedArray<T> {
     pub id: u64,
     pub entries: Vec<Option<T>>,
-    pub delta: Vec<Delta<T>>,
+    /// Shared like JS's delta objects: `commit` leaves the base array and the committed one holding the same
+    /// deltas, and a writer that changes one (`Arc::make_mut`) gets its own copy of that delta only.
+    pub delta: Vec<Arc<Delta<T>>>,
     pub uentries: Option<Vec<Option<T>>>,
     pub updates: usize,
 }
@@ -277,7 +279,7 @@ impl<T: Copy> CompressedArray<T> {
         Self {
             id,
             entries,
-            delta,
+            delta: delta.into_iter().map(Arc::new).collect(),
             uentries: None,
             updates: 0,
         }
@@ -309,7 +311,8 @@ impl<T: Copy> CompressedArray<T> {
     }
 
     /// Freeze the pending updates into a new array; the old array is left at
-    /// its base state, as `CompressedArray.commit()` does.
+    /// its base state, as `CompressedArray.commit()` does. Both keep the same
+    /// deltas (JS `delta.slice`), not copies of them.
     pub fn commit(&mut self, new_id: u64) -> CompressedArray<T> {
         let mut c = CompressedArray::empty(new_id);
         c.delta = std::mem::take(&mut self.delta);
@@ -338,12 +341,12 @@ impl<T: Copy> CompressedArray<T> {
         let u = self.uentries.as_mut().expect("updated");
         if insert_at(u, index, Some(pointer)) {
             self.touch();
-            self.delta.push(Delta::new(
+            self.delta.push(Arc::new(Delta::new(
                 true,
                 OP_INSERT,
                 index,
                 Some(DeltaRef::Id(pointer)),
-            ));
+            )));
         }
     }
 
@@ -352,7 +355,8 @@ impl<T: Copy> CompressedArray<T> {
         let u = self.uentries.as_mut().expect("updated");
         if del_at(u, index) {
             self.touch();
-            self.delta.push(Delta::new(true, OP_DEL, index, None));
+            self.delta
+                .push(Arc::new(Delta::new(true, OP_DEL, index, None)));
         }
     }
 
@@ -361,8 +365,12 @@ impl<T: Copy> CompressedArray<T> {
         let u = self.uentries.as_mut().expect("updated");
         if set_at(u, index, Some(pointer)) {
             self.touch();
-            self.delta
-                .push(Delta::new(true, OP_SET, index, Some(DeltaRef::Id(pointer))));
+            self.delta.push(Arc::new(Delta::new(
+                true,
+                OP_SET,
+                index,
+                Some(DeltaRef::Id(pointer)),
+            )));
         }
     }
 
@@ -397,13 +405,14 @@ impl<T: Copy> CompressedArray<T> {
         head
     }
 
-    /// Port of `CompressedArray.flush`.
-    pub fn flush(&mut self, max: usize, min: usize) -> Vec<Delta<T>> {
+    /// Port of `CompressedArray.flush`. The returned deltas are the array's own
+    /// (shared); a caller that changes one does so through `Arc::make_mut`.
+    pub fn flush(&mut self, max: usize, min: usize) -> Vec<Arc<Delta<T>>> {
         self.updates = 0;
         self.uentries = None;
 
         if self.entries.len() < self.delta.len() {
-            self.delta = vec![rebuild_cohort(&self.entries)];
+            self.delta = vec![Arc::new(rebuild_cohort(&self.entries))];
             return self.delta.clone();
         }
 
@@ -417,15 +426,15 @@ impl<T: Copy> CompressedArray<T> {
             if last.kind == OP_COHORT {
                 break;
             }
-            direct.push(self.delta.pop().expect("checked"));
+            direct.push(Arc::unwrap_or_clone(self.delta.pop().expect("checked")));
         }
         direct.reverse();
         let l = direct.len();
 
         if l > min && l < self.entries.len() && !overflow && self.delta.len() < max {
-            self.delta.push(Delta::cohort(true, None, direct));
+            self.delta.push(Arc::new(Delta::cohort(true, None, direct)));
         } else {
-            self.delta = vec![rebuild_cohort(&self.entries)];
+            self.delta = vec![Arc::new(rebuild_cohort(&self.entries))];
         }
 
         self.delta.clone()

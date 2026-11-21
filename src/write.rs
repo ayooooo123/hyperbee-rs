@@ -372,7 +372,7 @@ enum PendingCohort {
     Children(Vec<Delta<PtrId>>),
 }
 
-type PendingTree = (Vec<Delta<KeyId>>, Vec<Delta<PtrId>>);
+type PendingTree = (Vec<Arc<Delta<KeyId>>>, Vec<Arc<Delta<PtrId>>>);
 type FoundKey = Option<(usize, KeyId)>;
 type KeySearch = (FoundKey, usize, usize, Ordering);
 
@@ -929,29 +929,39 @@ fn ptr_loc(st: &TreeState, ptr: PtrId) -> Loc {
     }
 }
 
+/// Whether `d` points into a block of another context and so must be rewritten
+/// for `ctx` (`relocate_loc`).
+fn foreign_loc<T>(d: &Delta<T>, ctx: &Arc<Context>) -> bool {
+    matches!(&d.ptr, Some(DeltaRef::Loc(from, _)) if !Arc::ptr_eq(from, ctx))
+}
+
+// The deltas are shared with the arrays that `commit` left behind (JS shares the objects). Only a delta that is
+// actually rewritten here is copied first (`Arc::make_mut`), so the base arrays keep their values, as before.
 fn prepare_keys(
     st: &mut TreeState,
     ctx: &Arc<Context>,
     seq: u64,
-    deltas: &mut [Delta<KeyId>],
+    deltas: &mut [Arc<Delta<KeyId>>],
     cohorts: &mut Vec<PendingCohort>,
 ) -> Result<()> {
-    for d in deltas.iter_mut() {
-        if d.changed
-            && let Some(DeltaRef::Id(k)) = d.ptr
-            && st.keys[k].changed
-        {
-            d.ptr = None;
+    for shared in deltas.iter_mut() {
+        let drop_id =
+            shared.changed && matches!(shared.ptr, Some(DeltaRef::Id(k)) if st.keys[k].changed);
+        if drop_id {
+            Arc::make_mut(shared).ptr = None;
         }
-        if let Some(DeltaRef::Loc(from, loc)) = &mut d.ptr {
+        if foreign_loc(shared, ctx)
+            && let Some(DeltaRef::Loc(from, loc)) = &mut Arc::make_mut(shared).ptr
+        {
             relocate_loc(from, ctx, loc)?;
         }
-        if let Some(DeltaRef::Id(k)) = d.ptr {
+        if let Some(DeltaRef::Id(k)) = shared.ptr {
             relocate_key(st, ctx, k)?;
         }
-        if d.kind != OP_COHORT || !d.changed {
+        if shared.kind != OP_COHORT || !shared.changed {
             continue;
         }
+        let d = Arc::make_mut(shared);
         d.changed = false;
         d.ptr = Some(DeltaRef::Loc(
             ctx.clone(),
@@ -983,19 +993,22 @@ fn prepare_children(
     st: &mut TreeState,
     ctx: &Arc<Context>,
     seq: u64,
-    deltas: &mut [Delta<PtrId>],
+    deltas: &mut [Arc<Delta<PtrId>>],
     cohorts: &mut Vec<PendingCohort>,
 ) -> Result<()> {
-    for d in deltas.iter_mut() {
-        if let Some(DeltaRef::Loc(from, loc)) = &mut d.ptr {
+    for shared in deltas.iter_mut() {
+        if foreign_loc(shared, ctx)
+            && let Some(DeltaRef::Loc(from, loc)) = &mut Arc::make_mut(shared).ptr
+        {
             relocate_loc(from, ctx, loc)?;
         }
-        if let Some(DeltaRef::Id(p)) = d.ptr {
+        if let Some(DeltaRef::Id(p)) = shared.ptr {
             relocate_ptr(st, ctx, p)?;
         }
-        if d.kind != OP_COHORT || !d.changed {
+        if shared.kind != OP_COHORT || !shared.changed {
             continue;
         }
+        let d = Arc::make_mut(shared);
         d.changed = false;
         d.ptr = Some(DeltaRef::Loc(
             ctx.clone(),
